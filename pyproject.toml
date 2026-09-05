@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "da-vllm"
+version = "0.1.0"
+description = "Declarative Attention (DA): model-declared sparse attention for vLLM"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# The versions the paper's results were produced with. Pinned exactly; see docs/ENVIRONMENT.md.
+serve = [
+  "torch==2.11.0",
+  "vllm==0.20.2",
+  "transformers==5.5.4",
+  "triton==3.6.0",
+  "flash-linear-attention==0.5.0",
+  "causal-conv1d==1.6.1",
+  "datasets==3.6.0",
+]
+dev = ["pytest>=8", "jinja2>=3"]
+
+[project.scripts]
+da = "da_vllm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+da_vllm = ["resources/*.py", "resources/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

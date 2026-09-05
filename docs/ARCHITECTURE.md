@@ -1,0 +1,189 @@
+# Architecture
+
+## The flow of one request
+
+```
+context, question
+      |
+      v
+Segmenter               character-offset space, ~2048-token magic chunks
+      |
+      v
+PromptRenderer          system turn -> bootstrap user turn ->
+      |                 (assistant get_magic_chunk call, tool response) x N ->
+      |                 DA instruction turn, all via apply_chat_template(tools=)
+      v
+tokenize  --------------------------------------> vLLM.generate(TokensPrompt,
+      |                                              extra_args={da_enable: True})
+      v                                                       |
+build_prompt_map        turn/tool boundaries -> segment       |  (engine process)
+      |                 token spans, sink, local window       v
+      v                                            DALogitsProcessor.__init__
+DAStateMachine                                         installs the patch
+      |                                                installs the shared mask
+      |  per decode step                                      |
+      |                                                       v
+      +--> update_state(batch_update): reconcile rows, advance state machines,
+      |                                rewrite changed GPU mask rows
+      |                                                       |
+      v                                                       v
+SharedMaskStore  (max_num_seqs x max_model_len bool) <---- writes
+      ^
+      | reads
+FlashAttention / Triton MetadataBuilder.build  (patched)
+      |
+      +--> common_prefix_len = 0; skip sliding-window groups; learn block size;
+           remap block_table in place; seq_lens through a stable scratch
+      |
+      v
+the stock attention kernel, reading fewer KV pages
+```
+
+Afterwards, offline: `metrics.replay` reconstructs attended tokens from the
+returned text, `eval.judge` scores the `<answer>` content with one fixed judge,
+and `eval.score` aggregates macro over the 15 sources.
+
+## The mask, precisely
+
+A request's mask is a boolean row over KV positions. Three regions are kept in
+**every** non-global mode:
+
+1. **Attention sink** — prompt tokens `[0, 16)`, StreamingLLM style. This is
+   why the system turn exists: without a content-free preamble at the front, a
+   context token lands in the sink, and without the sink at all, long-context
+   decoding degenerates into `<local>` loops.
+2. **Local window** — from the last occurrence of the `# Question` header to
+   the end of the prompt, assistant header included. Falls back to the last
+   1024 prompt tokens if the marker is missing. The search is bounded to the
+   prompt region: running it over the model's own output was one of the silent
+   bugs.
+3. **The response** — every position from `prompt_len` onward, unconditionally,
+   including tokens not yet generated. The boundary never moves, so a token
+   written after the mask was frozen can never fall out of it, and a row only
+   needs rewriting when the mode changes.
+
+`FOCUS` adds the named segment spans. `LOCAL` adds nothing. `GLOBAL` is the
+all-True row.
+
+Every region is written through one function (`_MaskWriter.keep`) that feeds
+both the dense mask and the span list, so the GPU writer and the reference mask
+cannot drift apart.
+
+### Block alignment
+
+Kept spans are rounded **outward** to KV block boundaries: a block is kept if
+any position in it is kept. The cost is at most one extra block per span edge —
+a few dozen tokens against a 2048-token segment. The tail block containing the
+token just written is always kept; compacting past it makes the kernel unable to
+see the current token's own key and the model loses coherence within a few
+steps.
+
+Nothing is ever evicted. DA reduces bytes *read*, not bytes *stored*, and gives
+no batch-capacity benefit.
+
+## Tag detection
+
+A string scan over incrementally decoded text — not a token-id match, not a
+logits hook. After each generated token, if that token's text contains `>`,
+four tail-anchored regexes run over the last 500 characters:
+
+```
+open  focus   <focus[^>]*>.{0,8}$        then a strict parse of magic_chunks="..."
+close focus   </focus>.{0,8}$
+open  local   <(?:local|answer)>.{0,8}$
+close local   </(?:local|answer)>.{0,8}$
+```
+
+`.{0,8}$` tolerates trailing characters arriving in the same token. `<global>`
+has no regex and causes no transition. `<answer>` is an alias of `<local>`, so
+the answer is written without seeing any context segment. When several tags land
+in one scan they are applied in textual order, so `</focus><local>` closes
+before it opens.
+
+Focus opens **only** from GLOBAL. Closing either FOCUS or LOCAL returns to
+GLOBAL and drops the mask.
+
+Focus parsing declines on any doubt — a syntax error, an empty list, an unknown
+id, more than three ids, or a prompt with no detected segments — and records the
+reason. A declined focus costs efficiency; a wrong focus corrupts the answer.
+
+## The one-step lag
+
+vLLM samples on the GPU and copies tokens back asynchronously, so when the state
+machine runs before step *k* the token from step *k-1* may still be the
+placeholder `-1`. The walk stops at the first negative id and revisits it next
+step, which means the mask applied at step *k* reflects the text through step
+*k-2*. This is symmetric in both directions, and the scaffold part of the mask
+is mode-invariant, so a stale mask never drops something the current token
+needs. `metrics.replay` reproduces the same lag by default.
+
+## Where the code runs
+
+vLLM V1 runs the model in an EngineCore subprocess: **a monkeypatch applied in
+the parent process patches nothing.** The patch is installed from the
+constructor of `DALogitsProcessor`, which vLLM instantiates inside EngineCore.
+For tensor parallel > 1 see [ENVIRONMENT.md](ENVIRONMENT.md#tensor-parallel--1).
+
+The logits processor is the driver, not a filter: `apply()` is the identity and
+`is_argmax_invariant()` returns True. All the work happens in `update_state`,
+which reconciles the batch (removed, then added, then moved rows, honouring swap
+semantics), advances each state machine over the tokens vLLM appended since the
+last step — holding a **live reference** to vLLM's output list, never a copy —
+and rewrites the GPU mask row for any request whose mode changed. Requests
+without DA enabled skip state construction entirely: building it requires
+decoding the whole prompt, about a second at 131K tokens, on the engine's hot
+path.
+
+The one exception to `apply()` being the identity is the runaway guard, which
+overwrites a row's logits to force EOS. That changes the argmax, so with the
+guard on `is_argmax_invariant()` returns False or vLLM skips `apply()` on the
+greedy path.
+
+## The remap
+
+For every row `r`, with the calling builder's own block size `b`:
+
+```
+allowed[r, j]  = any(mask[r, j*b : (j+1)*b])
+num_blocks[r]  = ceil(seq_lens[r] / b)
+valid[r, j]    = j < num_blocks[r]
+kept[r, j]     = valid[r, j] and allowed[r, j]
+remap[r]       = query_len[r] == 1 and any(valid[r] and not allowed[r])
+if remap[r]:
+    block_table[r, 0:N] = block_table[r, kept columns]
+    seq_lens[r] = (N - tail_kept) * b + (tail_valid_len if tail_kept else 0)
+```
+
+Rows in prefill (query length above 1) and rows with nothing pruned are
+untouched, which is why chunked prefill needs no special handling. Prefix
+caching stays correct because the remap rewrites the per-step GPU copy of the
+block table, never the block manager's source of truth. FlashAttention's AOT
+scheduler metadata is deliberately **not** recomputed: it falls back to non-AOT
+scheduling on stale metadata, and Triton never reads it. `max_seq_len` is left at
+the uncompacted value — a safe over-estimate, since kernels stop at `seq_lens`.
+
+`remap_readable` is that, literally. `remap_optimized` is the same function with
+every host-device sync removed:
+
+- `should_remap` stays on the GPU; there is no early exit;
+- boolean indexing becomes a dense `scatter_` into an `(R, max_blocks + 1)`
+  buffer that sends unkept blocks to a sentinel column, then `torch.where` to
+  preserve non-remapped rows exactly;
+- `seq_lens` is computed with `torch.where` and `copy_`;
+- only the **R active rows** of the shared mask are aggregated. Scanning the
+  whole `(max_num_seqs, max_model_len)` allocation costs about 2 ms per step at
+  262K and 7 ms at 1M with vLLM's default 1024 sequences, paid even when nothing
+  is pruned; it once showed up as an intercept shift in time-versus-bytes fits
+  and made one model look net-negative.
+
+The two are asserted bit-identical across a randomized sweep of batch sizes,
+block sizes, sequence lengths and prune patterns, including R = 0, narrow block
+tables and sequences longer than `max_model_len`.
+
+## CUDA graphs
+
+Anything the patch touches must keep a stable pointer across replays: `seq_lens`
+goes through a shape-keyed scratch cache and `block_table` is mutated in place.
+Env-gated behaviour is read once, at install time — a replayed graph will not
+re-read an environment variable. Python monkeypatches on kernels are bypassed
+inside a replayed graph, so kernel capture for microbenchmarks needs eager mode.
