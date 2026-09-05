@@ -167,3 +167,40 @@ def test_steady_state_writes_nothing_when_the_mode_does_not_change(setup):
     for token in tok.encode(" some extracted value", add_special_tokens=False):
         output.append(token)
         assert driver.step() == []
+
+
+def test_the_processor_satisfies_vllms_real_logits_processor_contract(monkeypatch):
+    """vLLM loads a custom processor by ``module:qualname`` and then does
+    ``issubclass(obj, LogitsProcessor)``.  A dotted path fails to unpack, and a
+    non-subclass is rejected -- either way the driver never runs and the mask
+    silently does nothing."""
+    import importlib
+
+    import fake_vllm
+    from da_vllm.serving import DA_LOGITS_PROCESSOR_FQCN
+
+    fake_vllm.install(monkeypatch)
+    import da_vllm.masking.logits_processor as module
+
+    importlib.reload(module)
+    try:
+        loaded = fake_vllm.load_by_fqcn(DA_LOGITS_PROCESSOR_FQCN)
+        assert loaded is module.DALogitsProcessor
+        assert issubclass(loaded, fake_vllm.LogitsProcessor)
+        # The ABC declares four abstract methods; a missing one would make the
+        # class un-instantiable at engine start.
+        assert not getattr(loaded, "__abstractmethods__", frozenset())
+        with pytest.raises(ValueError):
+            fake_vllm.load_by_fqcn("da_vllm.masking.logits_processor:DADriver")
+    finally:
+        importlib.reload(module)
+
+
+def test_the_fqcn_uses_a_colon_not_a_dot():
+    from da_vllm.serving import DA_LOGITS_PROCESSOR_FQCN
+
+    module_path, _, qualname = DA_LOGITS_PROCESSOR_FQCN.partition(":")
+    assert qualname == "DALogitsProcessor"
+    assert module_path == "da_vllm.masking.logits_processor"
+    # vLLM does `logitproc.split(":")` and unpacks into exactly two names.
+    assert len(DA_LOGITS_PROCESSOR_FQCN.split(":")) == 2

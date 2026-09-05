@@ -39,6 +39,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.85
 DEFAULT_MAX_NUM_SEQS = 256
 
+#: How vLLM addresses a custom logits processor: ``module:qualname``.
+#: ``_load_logitsprocs_by_fqcns`` does ``logitproc.split(":")``, so a dotted
+#: path fails to unpack and the engine never starts.
+DA_LOGITS_PROCESSOR_FQCN = "da_vllm.masking.logits_processor:DALogitsProcessor"
+
 
 @dataclass
 class EngineOptions:
@@ -117,9 +122,10 @@ class EngineOptions:
             kwargs["additional_config"] = {
                 "declarative_attention": self.da_config.to_dict()
             }
-            kwargs["logits_processors"] = [
-                "da_vllm.masking.logits_processor.DALogitsProcessor"
-            ]
+            # vLLM splits a fully-qualified name on ":" -- `module:qualname`,
+            # not a dotted path. A dotted string raises "not enough values to
+            # unpack" before the engine finishes starting.
+            kwargs["logits_processors"] = [DA_LOGITS_PROCESSOR_FQCN]
         kwargs.update(self.extra_engine_kwargs)
         return kwargs
 

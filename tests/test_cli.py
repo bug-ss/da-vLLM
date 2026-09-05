@@ -76,7 +76,7 @@ def test_serve_command_is_copy_pasteable(capsys):
     assert cli.main(["serve-command", "--model", MODEL, "--arm", "da"]) == 0
     out = capsys.readouterr().out
     assert "vllm serve Qwen/Qwen3.6-27B" in out
-    assert "--logits-processors da_vllm.masking.logits_processor.DALogitsProcessor" in out
+    assert "--logits-processors da_vllm.masking.logits_processor:DALogitsProcessor" in out
     assert "export DA_VLLM_CONFIG=" in out
     assert "export VLLM_CACHE_ROOT=" in out
     # A plain (no-mask) arm must not register the processor.

@@ -36,7 +36,7 @@ is in [requirements-serve.txt](requirements-serve.txt) and
 ## Try it with no GPU
 
 ```bash
-pytest -q                            # 422 tests, no downloads
+pytest -q                            # 434 tests, no downloads
 python examples/offline_dryrun.py
 ```
 
@@ -116,10 +116,26 @@ column is the only one that proves the mask changed the computation.
 - [docs/VALIDATION.md](docs/VALIDATION.md) — the checklist
 - [docs/PITFALLS.md](docs/PITFALLS.md) — every known failure and where this code prevents it
 
+## Verified against real vLLM
+
+The integration was written from the guide and then **checked line by line
+against the actual `vllm==0.20.2` source**. That found four things it had
+wrong, all of which would have failed on a real GPU: the logits-processor FQCN
+separator (`module:qualname`, not dotted), the runner's cached
+`update_block_table` path pairing a compacted `seq_lens` with an uncompacted
+block table, CUDA-graph capture running through `build()`, and a `num_stages`
+tweak aimed at a kernel that 0.20.2 had already unified away. Plus one polarity
+bug of my own: "is this a sliding-window spec?" answers *no* for a rotating
+cache it has never heard of.
+
+`docs/ARCHITECTURE.md` lists exactly which vLLM files were read and what each
+one confirmed or corrected, and `tests/fake_vllm.py` mirrors the real
+signatures so the tests check the contract rather than an assumption.
+
 ## Tests
 
 ```bash
-pytest -q          # 422 tests, no GPU required
+pytest -q          # 434 tests, no GPU required
 ```
 
 The suite covers the segmenter's losslessness, prompt/detect round trips

@@ -66,6 +66,13 @@ class PatchState:
     remap_calls: int = 0
     last_stats: RemapStats | None = None
     patched_targets: list[str] = field(default_factory=list)
+    #: Builder classes whose ``supports_update_block_table`` we turned off.
+    disabled_block_table_reuse: list[type] = field(default_factory=list)
+    #: True while vLLM is capturing a CUDA graph.  The capture path runs
+    #: through ``build`` and Triton's capture override then does
+    #: ``seq_lens.fill_(1)`` on whatever tensor the metadata carries -- which
+    #: would be our scratch buffer.  Never remap during capture.
+    in_cudagraph_capture: bool = False
     #: One-shot warnings, so a structural surprise is loud once, not per step.
     _warned: set[str] = field(default_factory=set)
 
@@ -128,18 +135,32 @@ def _import_vllm_bits() -> dict[str, Any]:
     return out
 
 
-def is_sliding_window_spec(spec: Any, bits: dict[str, Any] | None = None) -> bool:
-    """True for any cache group whose pages hold only a recent window."""
+def is_maskable_spec(spec: Any, bits: dict[str, Any] | None = None) -> bool:
+    """True only for a cache group we can positively identify as full attention.
+
+    The polarity matters.  vLLM 0.20.2 ships at least three rotating-cache
+    specs and they do not share an attribute: ``SlidingWindowSpec`` has
+    ``sliding_window``, ``ChunkedLocalAttentionSpec`` has
+    ``attention_chunk_size``, ``MambaSpec`` has neither and is not an
+    ``AttentionSpec`` at all.  Asking "is this sliding?" therefore answers
+    *no* for a spec it has never heard of, and DA would compact a cache whose
+    pages rotate -- a mask over older positions dereferences rotated slots.
+
+    So the question is inverted: mask only what is provably
+    ``FullAttentionSpec``.  Every gate in DA is biased toward declining.
+    """
     bits = bits if bits is not None else {}
-    cls = bits.get("SlidingWindowSpec")
-    if cls is not None and isinstance(spec, cls):
-        return True
     full_cls = bits.get("FullAttentionSpec")
-    if full_cls is not None and isinstance(spec, full_cls):
+    if full_cls is not None:
+        return isinstance(spec, full_cls)
+    # No class to check against (vLLM not importable): fall back to refusing
+    # anything that advertises a bounded window, and say so.
+    if spec is None:
         return False
-    # Fallback for specs we have no class for: a non-None window means the
-    # pages rotate, so the mask must not touch this group.
-    return getattr(spec, "sliding_window", None) is not None
+    return not any(
+        getattr(spec, attr, None) is not None
+        for attr in ("sliding_window", "attention_chunk_size")
+    )
 
 
 def _query_lens(state: PatchState, common_attn_metadata: Any, num_rows: int, device):
@@ -266,10 +287,15 @@ def _make_wrapper(original: Callable[..., Any], state: PatchState, bits: dict[st
 
         spec = getattr(self, "kv_cache_spec", None)
         block_size = getattr(self, "block_size", None)
-        sliding = is_sliding_window_spec(spec, bits)
+        maskable = is_maskable_spec(spec, bits)
         if block_size:
-            state.note_block_size(int(block_size), from_sliding_window=sliding)
-        if sliding:
+            state.note_block_size(int(block_size), from_sliding_window=not maskable)
+        if not maskable:
+            return metadata
+        if state.in_cudagraph_capture:
+            # Capture runs through build(); a captured graph must not bake a
+            # compacted table, and Triton's capture path overwrites seq_lens
+            # in place afterwards.
             return metadata
         if not block_size:
             state.warn_once("no_bs", "builder has no block_size; DA mask not applied")
@@ -286,6 +312,44 @@ def _make_wrapper(original: Callable[..., Any], state: PatchState, bits: dict[st
     build.__doc__ = original.__doc__
     build._da_original = original  # type: ignore[attr-defined]
     return build
+
+
+def _make_capture_wrapper(original: Callable[..., Any], state: PatchState):
+    """Mark the capture window so ``build`` skips the remap inside it."""
+
+    def build_for_cudagraph_capture(self, common_attn_metadata, *args, **kwargs):
+        previous = state.in_cudagraph_capture
+        state.in_cudagraph_capture = True
+        try:
+            return original(self, common_attn_metadata, *args, **kwargs)
+        finally:
+            state.in_cudagraph_capture = previous
+
+    build_for_cudagraph_capture._da_original = original  # type: ignore[attr-defined]
+    return build_for_cudagraph_capture
+
+
+def _disable_block_table_reuse(cls: type, state: PatchState) -> None:
+    """Force the runner to call ``build`` for every KV-cache group.
+
+    vLLM 0.20.2's model runner caches one metadata build per
+    ``(kv_cache_spec, builder type)`` and gives later groups a shallow copy
+    with only the block table swapped, when the builder sets
+    ``supports_update_block_table``.  That copy keeps the *first* group's
+    ``seq_lens`` -- which, under DA, is our compacted scratch tensor -- while
+    carrying an uncompacted block table.  The kernel would then read the first
+    N blocks of the full table: wrong KV, plausible-looking NLL.
+
+    Rebuilding per group costs a little host time and removes the hazard.
+    """
+    if getattr(cls, "supports_update_block_table", False):
+        state.disabled_block_table_reuse.append(cls)
+        cls.supports_update_block_table = False
+        logger.info(
+            "da: disabled block-table reuse on %s so every KV-cache group "
+            "rebuilds its metadata",
+            cls.__name__,
+        )
 
 
 def install_patch(config: DAConfig, *, force: bool = False) -> PatchState:
@@ -315,6 +379,10 @@ def install_patch(config: DAConfig, *, force: bool = False) -> PatchState:
             continue
         original = getattr(current, "_da_original", current)
         cls.build = _make_wrapper(original, state, bits)
+        capture = getattr(cls, "build_for_cudagraph_capture", None)
+        if capture is not None and getattr(capture, "_da_original", None) is None:
+            cls.build_for_cudagraph_capture = _make_capture_wrapper(capture, state)
+        _disable_block_table_reuse(cls, state)
         state.patched_targets.append(name)
 
     if not state.patched_targets:
@@ -345,22 +413,39 @@ def uninstall_patch() -> None:
         original = getattr(cls.build, "_da_original", None)
         if original is not None:
             cls.build = original
+        capture = getattr(cls, "build_for_cudagraph_capture", None)
+        capture_original = getattr(capture, "_da_original", None)
+        if capture_original is not None:
+            cls.build_for_cudagraph_capture = capture_original
+    if _STATE is not None:
+        for cls in _STATE.disabled_block_table_reuse:
+            cls.supports_update_block_table = True
     _STATE = None
 
 
 class _KernelProxy:
-    """Forwards ``kernel[grid](...)`` with extra launch kwargs injected."""
+    """Forwards ``kernel[grid](...)`` with extra launch kwargs injected.
 
-    def __init__(self, kernel: Any, **launch_kwargs: Any) -> None:
+    ``__getitem__`` is looked up on the *type*, not the instance, so a plain
+    attribute assignment on the JITFunction would not intercept ``kernel[grid]``.
+    Hence a proxy object that replaces the module-level name.
+    """
+
+    def __init__(self, kernel: Any, *, grid_rank: int | None = None, **launch_kwargs: Any):
         self._kernel = kernel
+        self._grid_rank = grid_rank
         self._launch_kwargs = launch_kwargs
 
     def __getitem__(self, grid):
         launcher = self._kernel[grid]
+        applies = self._grid_rank is None or (
+            isinstance(grid, tuple) and len(grid) == self._grid_rank
+        )
 
         def run(*args, **kwargs):
-            for k, v in self._launch_kwargs.items():
-                kwargs.setdefault(k, v)
+            if applies:
+                for k, v in self._launch_kwargs.items():
+                    kwargs.setdefault(k, v)
             return launcher(*args, **kwargs)
 
         return run
@@ -369,23 +454,62 @@ class _KernelProxy:
         return getattr(self._kernel, item)
 
 
+#: vLLM 0.20.2 unified the 2D and 3D Triton attention kernels into a single
+#: ``kernel_unified_attention``; the decode (split-KV) path is the one launched
+#: with a 3-element grid ``(q_blocks, kv_heads, softmax_segments)``.
+_TRITON_KERNEL_MODULE = "vllm.v1.attention.ops.triton_unified_attention"
+_TRITON_KERNEL_NAME = "kernel_unified_attention"
+_TRITON_DECODE_GRID_RANK = 3
+
+
 def install_triton_num_stages(num_stages: int = 2) -> bool:
     """Pipeline vLLM 0.20.2's Triton decode kernel.
 
-    vLLM 0.20.2 launches the 3D (split-KV) decode kernel with no ``num_stages``,
-    so its KV loop is unpipelined and latency-bound at low batch.  Passing
-    ``num_stages=2`` is bit-exact and worth a few percent end to end on Gemma.
-    Entirely independent of DA -- it is here because it is free.
+    vLLM 0.20.2 launches the unified attention kernel with no ``num_stages``,
+    so on the split-KV decode path its KV loop is unpipelined and latency-bound
+    at low batch.  Passing ``num_stages=2`` is bit-exact and worth a few percent
+    end to end on Gemma.  Entirely independent of DA -- it is here because it is
+    free.
+
+    Only the 3-element (decode) grid is touched; the prefill launch keeps
+    whatever Triton picks for it.
     """
     try:
-        from vllm.attention.ops import triton_unified_attention as mod  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        logger.info("da: triton_unified_attention unavailable (%s)", exc)
+        import importlib
+
+        mod = importlib.import_module(_TRITON_KERNEL_MODULE)
+    except Exception as exc:  # pragma: no cover - depends on the install
+        logger.info("da: %s unavailable (%s)", _TRITON_KERNEL_MODULE, exc)
         return False
-    name = "kernel_unified_attention_3d"
-    kernel = getattr(mod, name, None)
-    if kernel is None or isinstance(kernel, _KernelProxy):
+    kernel = getattr(mod, _TRITON_KERNEL_NAME, None)
+    if kernel is None:
+        logger.warning(
+            "da: %s has no %s; the num_stages tweak did nothing. vLLM renamed "
+            "or restructured the kernel -- check the version.",
+            _TRITON_KERNEL_MODULE,
+            _TRITON_KERNEL_NAME,
+        )
         return False
-    setattr(mod, name, _KernelProxy(kernel, num_stages=num_stages))
+    if isinstance(kernel, _KernelProxy):
+        return False
+    setattr(
+        mod,
+        _TRITON_KERNEL_NAME,
+        _KernelProxy(kernel, grid_rank=_TRITON_DECODE_GRID_RANK, num_stages=num_stages),
+    )
     logger.info("da: triton decode kernel launched with num_stages=%d", num_stages)
     return True
+
+
+def uninstall_triton_num_stages() -> bool:
+    try:
+        import importlib
+
+        mod = importlib.import_module(_TRITON_KERNEL_MODULE)
+    except Exception:  # pragma: no cover
+        return False
+    kernel = getattr(mod, _TRITON_KERNEL_NAME, None)
+    if isinstance(kernel, _KernelProxy):
+        setattr(mod, _TRITON_KERNEL_NAME, kernel._kernel)
+        return True
+    return False

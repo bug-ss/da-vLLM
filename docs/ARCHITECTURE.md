@@ -199,3 +199,72 @@ goes through a shape-keyed scratch cache and `block_table` is mutated in place.
 Env-gated behaviour is read once, at install time — a replayed graph will not
 re-read an environment variable. Python monkeypatches on kernels are bypassed
 inside a replayed graph, so kernel capture for microbenchmarks needs eager mode.
+
+
+## Verified against vLLM 0.20.2
+
+Everything in this document about vLLM was read off the real
+`vllm==0.20.2` wheel, not inferred. The files that matter:
+
+| What | Where in vLLM |
+| --- | --- |
+| `LogitsProcessor` ABC, `BatchUpdate`, `MoveDirectionality` | `vllm/v1/sample/logits_processor/interface.py` |
+| Custom-processor loading | `vllm/v1/sample/logits_processor/__init__.py` |
+| `build()` signature, `FlashAttentionMetadata` | `vllm/v1/attention/backends/flash_attn.py` |
+| `TritonAttentionMetadata`, capture override | `vllm/v1/attention/backends/triton_attn.py` |
+| `CommonAttentionMetadata`, `AttentionMetadataBuilder` | `vllm/v1/attention/backend.py` |
+| Per-group metadata construction | `vllm/v1/worker/gpu_model_runner.py` (~2170-2315) |
+| KV-cache spec hierarchy | `vllm/v1/kv_cache_interface.py` |
+| The Triton attention kernel | `vllm/v1/attention/ops/triton_unified_attention.py` |
+
+Confirmed as the guide describes:
+
+- `build(self, common_prefix_len, common_attn_metadata, fast_build=False)` on
+  both builders, and `self.block_size` comes from the builder's own
+  `kv_cache_spec` — so using a cached global really would use the wrong one.
+- Both metadata classes are plain mutable `@dataclass`es carrying
+  `seq_lens`, `block_table`, `query_start_loc`, `max_seq_len` and
+  `scheduler_metadata` under exactly those names.
+- The model runner builds one `CommonAttentionMetadata` and then does
+  `cm = copy(cm_base)` per KV-cache group, replacing **only**
+  `block_table_tensor` and `slot_mapping`. `seq_lens` is therefore literally
+  the same tensor object across groups — shrinking it in place for the
+  full-attention group is exactly the Gemma corruption the guide describes.
+- `BatchUpdate` carries `removed`/`added`/`moved` and documents that
+  operations are processed in that order, and that `output_tok_ids` "is a
+  reference to the request's running output tokens list".
+- `SamplingParams.extra_args` exists; over HTTP it arrives as `vllm_xargs`.
+
+Corrected against it — four things this integration had wrong:
+
+1. **A custom logits processor is addressed as `module:qualname`.** The loader
+   does `logitproc.split(":")` and unpacks two names, then checks
+   `issubclass(obj, LogitsProcessor)`. A dotted path raises before the engine
+   finishes starting.
+2. **`FlashAttentionMetadataBuilder.supports_update_block_table` is `True`.**
+   The runner caches one build per `(kv_cache_spec, builder type)` and hands
+   later groups a `copy.copy` with only the block table swapped — which would
+   pair the first group's *compacted* `seq_lens` with an *uncompacted* block
+   table. The patch turns that reuse off on the builders it hooks and restores
+   it on uninstall.
+3. **CUDA graph capture runs through `build()`.** Triton's
+   `build_for_cudagraph_capture` then does `attn_metadata.seq_lens.fill_(1)`
+   in place, which would write into the DA scratch buffer. The patch marks the
+   capture window and skips the remap inside it.
+4. **The Triton kernels were unified.** There is one
+   `kernel_unified_attention` in `vllm/v1/attention/ops/`, not the 2D/3D pair,
+   and the decode (split-KV) path is the 3-element-grid launch. `num_stages` is
+   indeed never passed, so the guide's tweak still applies — to that launch only.
+
+Also corrected, from the spec hierarchy: asking "is this a sliding-window
+spec?" is the wrong polarity. `SlidingWindowSpec` has `sliding_window`,
+`ChunkedLocalAttentionSpec` has `attention_chunk_size`, `MambaSpec` has
+neither — so the question answers *no* for any rotating cache it has not heard
+of. The patch now masks only a spec it can positively identify as
+`FullAttentionSpec`.
+
+`tests/fake_vllm.py` mirrors all of the above, so those tests check the
+integration against vLLM's actual contract rather than against an assumption.
+What they still cannot check is behaviour: no kernel runs, no CUDA graph is
+captured, no engine starts. Validation checklist items 1, 3 and 4 remain the
+only things that prove the mask does what it claims on real hardware.

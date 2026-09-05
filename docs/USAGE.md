@@ -4,7 +4,7 @@
 
 ```bash
 pip install -e '.[dev]'
-pytest -q                        # 422 tests, no GPU, no downloads
+pytest -q                        # 434 tests, no GPU, no downloads
 python examples/offline_dryrun.py
 ```
 

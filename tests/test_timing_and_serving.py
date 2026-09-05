@@ -77,7 +77,7 @@ def test_engine_kwargs_are_the_paper_settings():
     assert kwargs["dtype"] == "bfloat16"
     assert "enable_prefix_caching" not in kwargs  # vLLM's default
     assert kwargs["logits_processors"] == [
-        "da_vllm.masking.logits_processor.DALogitsProcessor"
+        "da_vllm.masking.logits_processor:DALogitsProcessor"
     ]
 
 

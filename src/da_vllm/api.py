@@ -344,19 +344,38 @@ class DAEngine:
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
-        """Release the engine.  Orphaned EngineCore children hold VRAM."""
+        """Release the engine.  Orphaned EngineCore children hold VRAM.
+
+        In vLLM 0.20.2 neither ``LLM`` nor ``LLMEngine`` has a ``shutdown``:
+        the method lives on the ``EngineCoreClient`` at
+        ``llm.llm_engine.engine_core``.  Dropping the reference alone leaves
+        the EngineCore subprocess to be reaped by ``__del__``, which is exactly
+        how it ends up reparented to PID 1 still holding VRAM.
+        """
         llm, self._llm = self._llm, None
         if llm is None:
             return
-        try:
-            engine = getattr(llm, "llm_engine", None)
-            for target in (engine, llm):
-                shutdown = getattr(target, "shutdown", None)
-                if callable(shutdown):
+        engine = getattr(llm, "llm_engine", None)
+        targets = (
+            getattr(engine, "engine_core", None),  # EngineCoreClient (0.20.x)
+            engine,
+            llm,
+        )
+        for target in targets:
+            shutdown = getattr(target, "shutdown", None)
+            if callable(shutdown):
+                try:
                     shutdown()
-                    break
-        except Exception:  # pragma: no cover
-            logger.exception("da: engine shutdown raised; check for leaked VRAM")
+                except Exception:  # pragma: no cover
+                    logger.exception(
+                        "da: engine shutdown raised; check for leaked VRAM"
+                    )
+                return
+        logger.warning(
+            "da: found no shutdown() on the engine; the EngineCore subprocess "
+            "may outlive this process and hold VRAM. Run each arm in its own "
+            "process group (see da_vllm.serving.engine_process)."
+        )
 
     def __enter__(self) -> "DAEngine":
         return self

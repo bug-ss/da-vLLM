@@ -194,3 +194,43 @@ def test_da_only_pays_once_the_context_clears_the_scaffold(
     assert (da.attended_tokens < vanilla.attended_tokens) is expect_win
     # But the mask always beats the same prompt unmasked -- that is the ablation.
     assert da.attended_tokens < nomask.attended_tokens
+
+
+def test_close_shuts_down_the_engine_core_client(family_case):
+    """vLLM 0.20.2 puts shutdown() on llm.llm_engine.engine_core, not on LLM."""
+    calls = []
+
+    class _Core:
+        def shutdown(self):
+            calls.append("engine_core")
+
+    class _Engine:
+        engine_core = _Core()
+
+    class _LLM:
+        llm_engine = _Engine()
+
+    hub_id, tok, _ = family_case
+    engine = DAEngine(
+        hub_id,
+        config=DAConfig(enabled=True, max_model_len=8192),
+        tokenizer=tok,
+        llm=_LLM(),
+    )
+    engine.close()
+    assert calls == ["engine_core"]
+    engine.close()  # idempotent
+    assert calls == ["engine_core"]
+
+
+def test_close_warns_when_no_shutdown_can_be_found(family_case, caplog):
+    hub_id, tok, _ = family_case
+    engine = DAEngine(
+        hub_id,
+        config=DAConfig(enabled=True, max_model_len=8192),
+        tokenizer=tok,
+        llm=object(),
+    )
+    with caplog.at_level("WARNING"):
+        engine.close()
+    assert "may outlive this process" in caplog.text
