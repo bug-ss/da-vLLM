@@ -15,13 +15,15 @@ fail-fast design let one bad sample abort a whole run.
 from __future__ import annotations
 
 import bisect
+import logging
 import re
 from dataclasses import dataclass
 from typing import Sequence
 
 from .config import DAConfig
 from .models import FamilySpec
-from .prompt import QUESTION_HEADER
+
+logger = logging.getLogger(__name__)
 
 _MAGIC_HEADER_RE = r"Magic Chunk (?P<id>\d+)\n"
 
@@ -118,10 +120,14 @@ def detect_segments(
     response, so the span covers the whole call-plus-response pair including
     wrapper tokens.
 
-    Validation is deliberately strict: turns must alternate
-    assistant-call / tool-response, and the detected ids must be exactly
-    1..N in order.  A non-greedy XML regex once truncated segments whose bodies
-    contained the closing tag, with contiguous ids so nothing flagged it.
+    Validation is deliberately strict: every tool response must be owned by an
+    assistant ``get_magic_chunk`` call turn, and the detected ids must be
+    exactly 1..N in order.  A non-greedy XML regex once truncated segments whose
+    bodies contained the closing tag, with contiguous ids so nothing flagged it.
+
+    Both turn layouts are accepted, because they are both real: Qwen opens a
+    new assistant turn per call, Gemma 4 collapses consecutive calls into one.
+    ``FamilySpec.collapses_consecutive_tool_calls`` says which to expect.
     """
     resp_re = re.compile(family.tool_response_prefix_regex + _MAGIC_HEADER_RE)
     asst_re = re.compile(family.assistant_turn_prefix_regex)
@@ -132,32 +138,47 @@ def detect_segments(
 
     spans: list[tuple[int, int, int]] = []
     expected = 1
+    # The assistant turn that opened the current run of tool calls.  Gemma 4
+    # collapses consecutive tool calls into one model turn while Qwen opens a
+    # new turn per call, so "which assistant turn owns this response" differs
+    # by family (guide 4.2).
+    open_call_turn: _Turn | None = None
     i = 0
     n = len(turns)
     while i < n:
         turn = turns[i]
         if turn.start >= context_region_end:
             break
-        m = resp_re.match(prompt_text, turn.start, turn.end)
-        if m is None:
+        is_call = asst_re.match(prompt_text, turn.start, turn.end) is not None and (
+            "get_magic_chunk" in prompt_text[turn.start : turn.end]
+        )
+        if is_call:
+            open_call_turn = turn
             i += 1
             continue
-        # A tool response.  Its call must be the turn immediately before it.
-        if i == 0:
-            return [], "tool response with no preceding assistant turn"
-        call = turns[i - 1]
-        if asst_re.match(prompt_text, call.start, call.end) is None:
-            return [], f"magic chunk {m.group('id')} not preceded by an assistant turn"
-        if "get_magic_chunk" not in prompt_text[call.start : call.end]:
-            return [], f"magic chunk {m.group('id')} preceded by a non-tool-call turn"
+        m = resp_re.match(prompt_text, turn.start, turn.end)
+        if m is None:
+            # Any other turn ends the current call/response run.
+            open_call_turn = None
+            i += 1
+            continue
+        if open_call_turn is None:
+            return [], f"magic chunk {m.group('id')} has no preceding tool call"
         found = int(m.group("id"))
         if found != expected:
             return [], f"magic chunk ids out of order: expected {expected}, found {found}"
         # The pair ends where the next turn begins (or at the context boundary).
         pair_end = turns[i + 1].start if i + 1 < n else turn.end
         pair_end = min(pair_end, context_region_end)
-        spans.append((found, call.start, pair_end))
+        # Under strict alternation the span starts at the call turn; the span
+        # of a later response in a collapsed run starts at its own turn, so the
+        # spans stay disjoint either way.
+        span_start = open_call_turn.start if not spans or spans[-1][2] <= open_call_turn.start else turn.start
+        spans.append((found, span_start, pair_end))
         expected += 1
+        if not family.collapses_consecutive_tool_calls:
+            # Qwen: one call turn per response, so the run ends here.
+            open_call_turn = None
         i += 1
 
     if not spans:
@@ -196,13 +217,22 @@ def build_prompt_map(
     # -- local window ------------------------------------------------------
     # Searched over the prompt region only.  A marker search that ran over the
     # model's own text was one of the silent-no-op bugs (guide 12).
-    header_at = prompt_text.rfind(QUESTION_HEADER)
+    # The configured marker, not a module constant: the renderer writes the
+    # same value, so changing one changes both (guide 4.3).
+    header_at = prompt_text.rfind(config.question_header)
     if header_at >= 0:
         local_start = _char_to_token(starts, header_at)
         local_fallback = False
     else:
         local_start = max(0, num_tokens - config.local_window_fallback_tokens)
         local_fallback = True
+        logger.warning(
+            "da: question header %r not found in the prompt; the local window "
+            "fell back to the last %d tokens. Renderer and detector must use "
+            "the same DAConfig.question_header.",
+            config.question_header,
+            config.local_window_fallback_tokens,
+        )
     local_start = min(local_start, max(0, num_tokens))
 
     if reason is not None:

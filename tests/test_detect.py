@@ -100,3 +100,81 @@ def test_focus_lookup_is_bounds_checked(family_case, config, filler):
     assert pmap.by_id(1) is not None
     assert pmap.by_id(0) is None
     assert pmap.by_id(len(pmap.segments) + 1) is None
+
+
+def _collapsed_prompt(family) -> str:
+    """One assistant turn carrying two tool calls, then both tool responses."""
+    ts, te = family.turn_start, family.turn_end
+    role = "model" if ts == "<start_of_turn>" else "assistant"
+    wrapper = "<tool_response>\n"
+    call = '<tool_call>\n{"name": "get_magic_chunk", "arguments": {"id": "%s"}}\n</tool_call>'
+    return (
+        f"{ts}user\nbootstrap{te}\n"
+        f"{ts}{role}\n{call % '1'}{call % '2'}{te}\n"
+        f"{ts}user\n{wrapper}Magic Chunk 1\nfirst body\n</tool_response>{te}\n"
+        f"{ts}user\n{wrapper}Magic Chunk 2\nsecond body\n</tool_response>{te}\n"
+        f"{ts}user\n# Question\nWho?{te}\n"
+    )
+
+
+def test_collapsed_tool_calls_are_accepted_only_where_the_family_collapses(family_case):
+    """Gemma 4 collapses consecutive tool calls into one model turn; Qwen opens
+    a new turn per call.  The detector must follow its family, not guess."""
+    hub_id, _, _ = family_case
+    family = get_model(hub_id).family
+    text = _collapsed_prompt(family)
+    spans, reason = detect_segments(
+        text, family, context_region_end=text.rfind("# Question")
+    )
+    if family.collapses_consecutive_tool_calls:
+        assert reason is None
+        assert [s[0] for s in spans] == [1, 2]
+        # Spans stay disjoint even though both share one call turn.
+        assert spans[0][2] <= spans[1][1]
+    else:
+        assert spans == []
+        assert "no preceding tool call" in reason
+
+
+def test_a_tool_response_before_any_call_is_rejected(family_case):
+    hub_id, _, _ = family_case
+    family = get_model(hub_id).family
+    ts, te = family.turn_start, family.turn_end
+    text = (
+        f"{ts}user\n<tool_response>\nMagic Chunk 1\nbody\n</tool_response>{te}\n"
+        f"{ts}user\n# Question\nWho?{te}\n"
+    )
+    spans, reason = detect_segments(
+        text, family, context_region_end=text.rfind("# Question")
+    )
+    assert spans == [] and "no preceding tool call" in reason
+
+
+def test_the_configured_question_header_drives_both_render_and_detect(family_case, filler):
+    from da_vllm.config import DAConfig
+    from da_vllm.prompt import PromptRenderer
+    from da_vllm.segmenter import Segmenter
+
+    hub_id, tok, _ = family_case
+    custom = DAConfig(
+        enabled=True,
+        max_model_len=65536,
+        question_header="### THE QUESTION",
+        segment_target_tokens=120,
+        segment_max_tokens=150,
+    )
+    renderer = PromptRenderer(
+        tok, hub_id, config=custom, segmenter=Segmenter(tok, target_tokens=120, max_tokens=150)
+    )
+    prompt = renderer.render_da(filler, "Who?")
+    assert "### THE QUESTION" in prompt.text and "# Question" not in prompt.text
+
+    pmap = build_prompt_map(tok, prompt.text, get_model(hub_id).family, custom)
+    assert not pmap.local_window_is_fallback
+    assert pmap.local_window_start >= pmap.segments[-1].token_end
+
+    # And the stale default no longer finds anything: the fallback fires, loudly.
+    stale = build_prompt_map(tok, prompt.text, get_model(hub_id).family, DAConfig(
+        enabled=True, max_model_len=65536
+    ))
+    assert stale.local_window_is_fallback

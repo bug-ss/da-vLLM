@@ -30,6 +30,31 @@ from .shared import SharedMaskStore, install_shared_mask
 
 logger = logging.getLogger(__name__)
 
+
+def _logits_processor_base() -> type:
+    """vLLM validates ``issubclass(cls, LogitsProcessor)`` when loading a custom
+    processor, so the real ABC has to be the base whenever vLLM is importable.
+
+    Resolved at import time rather than hardcoded so the module also imports
+    (and stays testable) on a machine with no vLLM.
+    """
+    try:
+        from vllm.v1.sample.logits_processor import LogitsProcessor  # type: ignore
+
+        return LogitsProcessor
+    except Exception:  # pragma: no cover - depends on the install
+        try:
+            from vllm.v1.sample.logits_processor.interface import (  # type: ignore
+                LogitsProcessor,
+            )
+
+            return LogitsProcessor
+        except Exception:
+            return object
+
+
+LogitsProcessorBase = _logits_processor_base()
+
 #: Requests opt in explicitly.  A "is this vanilla" shortcut keyed on config
 #: shape once also matched DA traffic (guide 12) -- there is no inference here.
 DA_ENABLE_KEY = "da_enable"
@@ -77,6 +102,11 @@ class DADriver:
         self.tokenizer = tokenizer
         self.spec = resolve(model, model_type=model_type)
         self.rows: dict[int, _Entry] = {}
+        #: Every slot a DA request has ever occupied.  A slot that leaves
+        #: ``rows`` by any path -- removal, a move, or being overwritten by a
+        #: plain request -- is reset to all-True before the next step, so a
+        #: recycled slot can never keep stale mask data (guide 6.2).
+        self._touched_rows: set[int] = set()
         self.stats = DriverStats()
 
     # -- batch reconciliation ---------------------------------------------
@@ -131,6 +161,7 @@ class DADriver:
             if self.config.runaway.enabled
             else None
         )
+        self._touched_rows.add(row)
         self.rows[row] = _Entry(
             request_id=request_id,
             state=state,
@@ -164,9 +195,13 @@ class DADriver:
             if a is not None:
                 a.dirty = True
                 self.rows[dst] = a
-        if dst not in self.rows:
+        if dst in self.rows:
+            self._touched_rows.add(dst)
+        else:
             self.store.reset_row(dst)
-        if src not in self.rows:
+        if src in self.rows:
+            self._touched_rows.add(src)
+        else:
             self.store.reset_row(src)
 
     # -- per-step work -----------------------------------------------------
@@ -180,6 +215,13 @@ class DADriver:
         patch_state = get_patch_state()
         if patch_state is not None:
             block_size = patch_state.block_size
+
+        # Any slot DA has used that no longer holds a DA request goes back to
+        # all-True exactly once.  This is the belt to the braces of resetting
+        # on remove/move/overwrite: it costs one set difference per step.
+        for row in self._touched_rows - self.rows.keys():
+            self.store.reset_row(row)
+        self._touched_rows &= self.rows.keys()
 
         written: list[int] = []
         for row, entry in self.rows.items():
@@ -228,6 +270,14 @@ class DADriver:
         text = self._extra_args(params).get(DA_PROMPT_TEXT_KEY)
         if isinstance(text, str) and text:
             return text
+        if not prompt_token_ids:
+            logger.warning(
+                "da: request has neither %s nor prompt token ids; focus will be "
+                "disabled. Pass the rendered prompt through extra_args -- some "
+                "vLLM versions do not hand prompt ids to logits processors.",
+                DA_PROMPT_TEXT_KEY,
+            )
+            return ""
         return self.tokenizer.decode(list(prompt_token_ids))
 
 
@@ -254,11 +304,12 @@ def read_da_config(vllm_config: Any) -> DAConfig:
     return DAConfig.from_dict(raw)
 
 
-class DALogitsProcessor:
+class DALogitsProcessor(LogitsProcessorBase):  # type: ignore[misc]
     """vLLM ``LogitsProcessor``.  Registered via ``logits_processors=[...]``."""
 
     def __init__(self, vllm_config: Any, device: Any, is_pin_memory: bool) -> None:
         self.config = read_da_config(vllm_config)
+        self.is_pin_memory = is_pin_memory
         self.device = device
         self.driver: DADriver | None = None
         self._eos_token_id: int | None = None

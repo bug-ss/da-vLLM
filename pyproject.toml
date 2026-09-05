@@ -10,17 +10,21 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-# The versions the paper's results were produced with. Pinned exactly; see docs/ENVIRONMENT.md.
+# The versions the paper's results were produced with. Pinned exactly.
+# causal-conv1d needs --no-build-isolation and deep-gemm comes from a git tag,
+# so both live in requirements-serve.txt rather than here. See
+# docs/ENVIRONMENT.md.
 serve = [
   "torch==2.11.0",
   "vllm==0.20.2",
   "transformers==5.5.4",
   "triton==3.6.0",
+  "flashinfer-python==0.6.8.post1",
   "flash-linear-attention==0.5.0",
-  "causal-conv1d==1.6.1",
   "datasets==3.6.0",
 ]
-dev = ["pytest>=8", "jinja2>=3"]
+# `jinja2` is a runtime dependency of da_vllm.testing, the offline tokenizer.
+dev = ["pytest>=8", "jinja2>=3", "pyflakes>=3"]
 
 [project.scripts]
 da = "da_vllm.cli:main"

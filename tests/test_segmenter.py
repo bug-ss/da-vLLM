@@ -1,7 +1,7 @@
 import pytest
 
 from da_vllm.segmenter import Segmenter, assert_lossless
-from fakes import lorem, qwen_tokenizer
+from da_vllm.testing import lorem, qwen_tokenizer
 
 
 @pytest.fixture

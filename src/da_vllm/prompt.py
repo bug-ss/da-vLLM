@@ -36,8 +36,14 @@ BOOTSTRAP_USER_TEXT = (
     'magic chunk id "1", until every magic chunk has been retrieved.'
 )
 
-#: The marker the local window is anchored on.  If you change this header,
-#: change :data:`QUESTION_HEADER` with it (guide 4.3).
+#: The marker the local window is anchored on.  The local window runs from the
+#: last occurrence of this header to the end of the prompt, so it must be the
+#: last non-blank line before the question (guide 4.3).
+#:
+#: Override it through ``DAConfig.question_header`` and **both** the renderer
+#: and the detector follow, because both read the same value.  Changing one and
+#: not the other silently drops the local window onto the last-1024-tokens
+#: fallback.
 QUESTION_HEADER = "# Question"
 
 TOOL_DECLARATION: dict[str, Any] = {
@@ -66,7 +72,7 @@ TOOL_DECLARATION: dict[str, Any] = {
 MAGIC_CHUNK_HEADER = "Magic Chunk {n}"
 
 DA_INSTRUCTION_TEMPLATE = """\
-# Question
+{question_header}
 {question}
 
 # Instructions
@@ -151,7 +157,7 @@ VANILLA_INSTRUCTION_TEMPLATE = """\
 # Context
 {context}
 
-# Question
+{question_header}
 {question}
 
 # INSTRUCTIONS
@@ -218,6 +224,11 @@ class PromptRenderer:
     ) -> None:
         self.tokenizer = tokenizer
         self.spec: ModelSpec = resolve(model, model_type=model_type)
+        # One value, read by the renderer here and by the detector when it
+        # locates the local window.  They cannot diverge.
+        self.question_header = (
+            config.question_header if config is not None else QUESTION_HEADER
+        )
         if segmenter is not None:
             self.segmenter = segmenter
         elif config is not None:
@@ -274,7 +285,9 @@ class PromptRenderer:
             {
                 "role": "user",
                 "content": DA_INSTRUCTION_TEMPLATE.format(
-                    question=question, answer_spec=ANSWER_SPEC
+                    question_header=self.question_header,
+                    question=question,
+                    answer_spec=ANSWER_SPEC,
                 ),
             }
         )
@@ -288,7 +301,10 @@ class PromptRenderer:
             {
                 "role": "user",
                 "content": VANILLA_INSTRUCTION_TEMPLATE.format(
-                    context=context, question=question, answer_spec=ANSWER_SPEC
+                    question_header=self.question_header,
+                    context=context,
+                    question=question,
+                    answer_spec=ANSWER_SPEC,
                 ),
             },
         ]

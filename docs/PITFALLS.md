@@ -11,6 +11,9 @@ where this repository makes it hard to repeat.
 | Attention workers under TP > 1 never construct the logits processor | `masking.worker_env()` ships `resources/sitecustomize.py` on `PYTHONPATH` with `VLLM_WORKER_MULTIPROC_METHOD=spawn`; `docs/ENVIRONMENT.md` states plainly that the mask itself is not broadcast to TP ranks |
 | An "is this vanilla" shortcut keyed on config shape also matched DA traffic | DA is per-request opt-in via an explicit `da_enable` flag; nothing is inferred from prompt or config shape (`masking/logits_processor.py`, `validation/checks.py::assert_explicit_enable`) |
 | A renamed config key was ignored and masking turned off | `DAConfig.from_dict` raises on any unknown key, nested config included (`test_config.py`) |
+| A config key that exists but nothing reads — the same failure wearing a different hat | `question_header`, `tag_tail_slack` and the segment sizes are each read by the code that acts on them, with a test that changing the value changes the behaviour |
+| vLLM rejects a custom logits processor that is not a subclass of its ABC, so the driver never runs | `DALogitsProcessor` resolves vLLM's `LogitsProcessor` as its base at import time, falling back to `object` only where vLLM is absent |
+| A slot recycled from a DA request keeps a stale mask | Reset on remove, move and overwrite, **plus** a per-step sweep of every slot DA has ever touched that no longer holds a DA request |
 | A 4D mask dropped by an inherited loss function; an assistant mask that fell through a `not None` guard | `training.require_mask` / `training.loss_positions` raise loudly instead of training on full attention |
 | Two-column NLL checks agreed while the mask did nothing | Three-column parity, `v ~ d < dv`; `ParityResult.explain()` names the no-op signature outright (`validation/nll_parity.py`) |
 
@@ -64,12 +67,15 @@ where this repository makes it hard to repeat.
 | Format failures quietly excluded | Counted as wrong, without a judge call |
 | Non-terminating responses inflated attended tokens (6% of responses on one model) | `report()` always returns as-logged **and** `decode_steps >= 8000` excluded |
 | Numbers recomputed from cached summaries | `eval/score.py` reads only raw per-response records |
+| A rubric whose authoring model was not recorded, so it cannot be audited | `generate_rubrics` stores the author on every rubric, and a failed generation is recorded as a failure rather than filled in |
+| A synthetic question silently swapped onto a source that uses original QA | `attach_questions` raises unless the source is one of the four the paper marks synthetic |
 
 ## Cost model
 
 | Failure | Prevention |
 | --- | --- |
 | A 2x byte error (Gemma's global head dim) produced a false finding, two theories, and a wrong "correction" | Byte counts derive from the live config (`global_kv_bytes_per_token`) or the checkpoint's tensor shapes (`global_kv_bytes_from_shapes`); a hybrid config missing `global_head_dim` raises rather than borrowing the sliding values; `verify_geometry` cross-checks the registry |
+| A registry number nobody verified being published as if it were measured | Geometry carries a `source`; only the two headline models are `"measured"`. The cost model **refuses** a `"placeholder"` geometry, and `da models` flags them. Derive the real values with `geometry_from_config` |
 | A fixed per-step remap tax read as a DA property, traced to scanning the whole mask allocation | `remap_optimized` aggregates only the R active rows |
 | A macro roofline slope used as a per-kernel attention share | `roofline_response` returns the three terms separately and the docstring says it is a ceiling, not a measurement |
 | "DA frees KV capacity" claimed and retracted | Stated in the architecture doc and the state-machine docstring: nothing is evicted, DA reduces bytes read, not bytes stored |

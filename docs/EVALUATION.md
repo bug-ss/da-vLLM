@@ -39,6 +39,27 @@ where a source ships train plus validation.
 
 Result on the headline models: 1611 examples per arm.
 
+### Running it
+
+`examples/run_eval.sh`, or the four commands it wraps (`da prepare`, `da run`,
+`da judge`, `da score`).  Input is a JSONL file, one example per line:
+
+```json
+{"example_id": "ruler/niah_single_1:0", "source": "ruler/niah_single_1",
+ "context": "...", "question": "...", "reference_answer": "...",
+ "rubric": "- CORRECT if the response states ..."}
+```
+
+Rubrics are an **input**, not something a public split carries.  Generate them
+with `da_vllm.eval.rubrics.generate_rubrics`, which stores the authoring model
+next to each rubric -- a rubric whose author is unknown cannot be audited later.
+`attach_questions` merges the four sources' synthetic questions and refuses to
+rewrite a question on a source that uses its original QA.
+
+Run **one arm per process** (`da run --arm ...`): an orphaned EngineCore
+reparents to PID 1 and holds VRAM across arms, and each arm needs its own
+compile cache.
+
 ## Arms
 
 | Arm | Prompt | Mask |
@@ -123,6 +144,29 @@ the attended-token sum as logged. On one mid-size model this was 6% of responses
 and put its attended tokens above vanilla until excluded. `eval.score.report`
 always returns **both** views: as-logged, and with `decode_steps >= 8000`
 dropped.
+
+## DA does not pay on short contexts
+
+The 4096-token floor is not arbitrary.  The DA prompt carries a fixed scaffold
+-- the tool declaration, the ~1.7K-token instruction, and a turn wrapper per
+magic chunk -- and roughly half the decode steps run in global mode at that
+larger prompt length.  Measured against the analytic vanilla baseline with the
+2048-token segment target:
+
+| Context | DA vs vanilla attended tokens |
+| --- | --- |
+| ~1K tokens | worse than vanilla |
+| ~7.5K tokens | roughly break-even |
+| ~24K tokens | −27% |
+| ~47K tokens | −31% |
+
+The DA-no-mask arm reads more than vanilla at **every** length, which is the
+point of having it: the format costs, and the mask has to win that back before
+it wins anything.
+
+Segment size feeds the same arithmetic.  At the 2048-token target the per-chunk
+turn wrappers are about 8% of the prompt; at 200 tokens they are about 45% and
+the mask cannot make it back.  `tests/test_api.py` pins both ends of this.
 
 ## Numbers to check against
 

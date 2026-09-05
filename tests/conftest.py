@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 from da_vllm.config import DAConfig  # noqa: E402
 from da_vllm.prompt import PromptRenderer  # noqa: E402
 from da_vllm.segmenter import Segmenter  # noqa: E402
-from fakes import gemma_tokenizer, lorem, qwen_tokenizer  # noqa: E402
+from da_vllm.testing import gemma_tokenizer, lorem, qwen_tokenizer  # noqa: E402
 
 # Small segments so a test context produces many magic chunks quickly.
 TEST_TARGET = 120

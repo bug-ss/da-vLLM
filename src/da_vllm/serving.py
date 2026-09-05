@@ -179,6 +179,38 @@ def engine_process(argv: Sequence[str], env: dict[str, str] | None = None, *, ti
                 proc.wait()
 
 
+def vllm_serve_command(options: EngineOptions) -> tuple[list[str], dict[str, str]]:
+    """The ``vllm serve`` argv and environment for one arm.
+
+    Use this when the model is served over HTTP rather than in process.  The
+    DA mask only exists where the patch is installed, so an OpenAI-compatible
+    server has to be started with the logits processor registered -- a plain
+    ``vllm serve`` gives you the DA prompt format and full attention.
+
+    Per-request opt-in then travels in ``extra_body``::
+
+        {"vllm_xargs": {"da_enable": true, "da_prompt_text": "<the prompt>"}}
+    """
+    argv = ["vllm", "serve", options.model]
+    kwargs = options.engine_kwargs()
+    kwargs.pop("model", None)
+    logits_processors = kwargs.pop("logits_processors", None)
+    additional_config = kwargs.pop("additional_config", None)
+    for key, value in kwargs.items():
+        flag = "--" + key.replace("_", "-")
+        if isinstance(value, bool):
+            if value:
+                argv.append(flag)
+        else:
+            argv += [flag, str(value)]
+    if logits_processors:
+        for entry in logits_processors:
+            argv += ["--logits-processors", entry]
+    if additional_config is not None:
+        argv += ["--additional-config", json.dumps(additional_config)]
+    return argv, options.engine_env()
+
+
 def describe_kv_capacity(llm: Any) -> dict[str, Any]:
     """Report what vLLM actually allocated, with the caveat attached.
 

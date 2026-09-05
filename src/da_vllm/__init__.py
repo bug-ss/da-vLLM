@@ -17,6 +17,7 @@ from __future__ import annotations
 
 __version__ = "0.1.0"
 
+from .api import DAAnswer, DAEngine
 from .config import DAConfig, RunawayConfig
 from .detect import PromptMap, build_prompt_map
 from .models import ModelSpec, get_model, get_model_by_type, registered_hub_ids
@@ -25,7 +26,9 @@ from .segmenter import Segment, Segmenter
 from .state_machine import DAStateMachine, MaskSnapshot, Mode, align_spans
 
 __all__ = [
+    "DAAnswer",
     "DAConfig",
+    "DAEngine",
     "DAStateMachine",
     "MaskSnapshot",
     "Mode",

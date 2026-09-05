@@ -11,6 +11,7 @@ from da_vllm.metrics.replay import (
 from da_vllm.metrics.roofline import (
     GeometryError,
     count_global_layers,
+    geometry_from_config,
     global_kv_bytes_from_shapes,
     global_kv_bytes_per_token,
     roofline_response,
@@ -182,3 +183,48 @@ def test_reproduces_the_papers_projected_speedups(
         decode_steps=round(steps_v * step_growth),
     )
     assert da.total_s / v.total_s == pytest.approx(expected, abs=0.01)
+
+
+def test_placeholder_geometry_is_refused_by_the_cost_model():
+    spec = get_model("Qwen/Qwen3.5-4B")
+    assert not spec.geometry.verified
+    with pytest.raises(GeometryError, match="PLACEHOLDER"):
+        roofline_response(
+            geometry=spec.geometry,
+            active_params=spec.active_params,
+            attended_tokens=1_000_000,
+            decode_steps=100,
+        )
+    # Explicitly acknowledged, it still computes -- it just must not be published.
+    assert (
+        roofline_response(
+            geometry=spec.geometry,
+            active_params=spec.active_params,
+            attended_tokens=1_000_000,
+            decode_steps=100,
+            allow_placeholder_geometry=True,
+        ).total_s
+        > 0
+    )
+
+
+def test_deriving_from_a_live_config_produces_a_usable_geometry():
+    spec = get_model("google/gemma-4-12B-it")
+    assert not spec.geometry.verified
+    config = {
+        "layer_types": ["full_attention"] * 8 + ["sliding_attention"] * 40,
+        "global_head_dim": 256,
+        "num_global_key_value_heads": 4,
+        "head_dim": 256,
+        "num_key_value_heads": 8,
+        "sliding_window": 1024,
+    }
+    derived = geometry_from_config(spec, config)
+    assert derived.verified and derived.source == "derived"
+    assert derived.global_kv_bytes_per_token == global_kv_bytes_per_token(config)
+    roofline_response(
+        geometry=derived,
+        active_params=spec.active_params,
+        attended_tokens=1_000_000,
+        decode_steps=100,
+    )

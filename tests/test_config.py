@@ -46,7 +46,7 @@ def test_runaway_thresholds_are_the_calibrated_ones():
 
 def test_segment_sizes_flow_from_the_config_into_the_renderer():
     from da_vllm.prompt import PromptRenderer
-    from fakes import qwen_tokenizer
+    from da_vllm.testing import qwen_tokenizer
 
     cfg = DAConfig(enabled=True, segment_target_tokens=64, segment_max_tokens=80)
     renderer = PromptRenderer(qwen_tokenizer(), "Qwen/Qwen3.6-27B", config=cfg)

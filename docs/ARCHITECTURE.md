@@ -52,11 +52,13 @@ A request's mask is a boolean row over KV positions. Three regions are kept in
    why the system turn exists: without a content-free preamble at the front, a
    context token lands in the sink, and without the sink at all, long-context
    decoding degenerates into `<local>` loops.
-2. **Local window** — from the last occurrence of the `# Question` header to
-   the end of the prompt, assistant header included. Falls back to the last
-   1024 prompt tokens if the marker is missing. The search is bounded to the
-   prompt region: running it over the model's own output was one of the silent
-   bugs.
+2. **Local window** — from the last occurrence of the question header to the
+   end of the prompt, assistant header included. Falls back to the last 1024
+   prompt tokens if the marker is missing, and logs a warning when it does. The
+   header comes from `DAConfig.question_header`, which the renderer writes and
+   the detector reads, so the two cannot diverge; the search is bounded to the
+   prompt region, because running it over the model's own output was one of the
+   silent bugs.
 3. **The response** — every position from `prompt_len` onward, unconditionally,
    including tokens not yet generated. The boundary never moves, so a token
    written after the mask was frozen can never fall out of it, and a row only
@@ -102,6 +104,16 @@ before it opens.
 
 Focus opens **only** from GLOBAL. Closing either FOCUS or LOCAL returns to
 GLOBAL and drops the mask.
+
+### Two turn layouts
+
+Qwen opens a new assistant turn per tool call; Gemma 4 collapses consecutive
+calls into a single model turn. The detector accepts both, driven by
+`FamilySpec.collapses_consecutive_tool_calls` rather than by guessing: a tool
+response must be owned by an assistant `get_magic_chunk` turn, and under a
+collapsing family one such turn can own several consecutive responses. The
+spans stay disjoint either way, and any other turn between a call and its
+response ends the run.
 
 Focus parsing declines on any doubt — a syntax error, an empty list, an unknown
 id, more than three ids, or a prompt with no detected segments — and records the

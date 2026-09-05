@@ -1,10 +1,18 @@
-"""Deterministic stand-ins for a HF tokenizer, so the whole prompt/detect/
-state-machine pipeline is testable without downloading a checkpoint.
+"""Offline stand-ins: a deterministic tokenizer with real chat templates.
 
-The chat templates below are *structurally* faithful to the two families the
-paper serves -- Qwen opens a new turn per tool call, Gemma collapses
-consecutive tool calls into a single model turn -- because the detector's
-strict-alternation logic depends on exactly that difference.
+Everything except the vLLM hook itself -- segmentation, rendering, detection,
+the state machine, mask construction, the remap, the replay -- can be exercised
+with these, so you can verify an install, dry-run a change, or write a test
+without downloading a checkpoint or touching a GPU.
+
+The chat templates are *structurally* faithful to the two families the paper
+serves: Qwen opens a new turn per tool call, Gemma collapses consecutive tool
+calls into a single model turn.  The detector's strict-alternation logic
+depends on exactly that difference.
+
+**Not a substitute for the real tokenizer.**  Token boundaries, special-token
+ids and the exact template text all differ.  Run ``da validate --model <model>``
+against the tokenizer you actually serve before trusting a segment map.
 """
 
 from __future__ import annotations
@@ -12,7 +20,7 @@ from __future__ import annotations
 import json
 import re
 
-from jinja2 import Environment
+
 
 _TOKEN_RE = re.compile(r"\s*[A-Za-z]+|\s*\d+|\s*[^\sA-Za-z\d]|\s+")
 _MAX_PIECE = 4  # split long runs, so token counts resemble a real BPE
@@ -73,10 +81,21 @@ GEMMA_TEMPLATE = """
 """
 
 
-class FakeTokenizer:
-    """Reversible, offset-exact, vocabulary-on-demand."""
+class SimpleTokenizer:
+    """Reversible, offset-exact, vocabulary-on-demand.
+
+    Implements the slice of the HuggingFace tokenizer API this package uses:
+    ``__call__(text, return_offsets_mapping=...)``, ``encode``, ``decode``,
+    ``convert_ids_to_tokens`` and ``apply_chat_template``.
+    """
 
     def __init__(self, template: str = QWEN_TEMPLATE) -> None:
+        try:
+            from jinja2 import Environment
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "da_vllm.testing needs jinja2: pip install 'da-vllm[dev]'"
+            ) from exc
         self._vocab: dict[str, int] = {}
         self._inv: list[str] = []
         self._env = Environment()
@@ -147,12 +166,18 @@ class FakeTokenizer:
         return rendered
 
 
-def qwen_tokenizer() -> FakeTokenizer:
-    return FakeTokenizer(QWEN_TEMPLATE)
+#: Backwards-compatible alias.
+FakeTokenizer = SimpleTokenizer
 
 
-def gemma_tokenizer() -> FakeTokenizer:
-    return FakeTokenizer(GEMMA_TEMPLATE)
+def qwen_tokenizer() -> SimpleTokenizer:
+    """A Qwen-3.5/3.6-shaped tokenizer: one turn per tool call."""
+    return SimpleTokenizer(QWEN_TEMPLATE)
+
+
+def gemma_tokenizer() -> SimpleTokenizer:
+    """A Gemma-4-shaped tokenizer: consecutive tool calls collapse."""
+    return SimpleTokenizer(GEMMA_TEMPLATE)
 
 
 def lorem(n_paragraphs: int, seed: int = 0) -> str:

@@ -51,6 +51,28 @@ rather than defaulting to another family's sampling parameters or chat template.
 | Gemma-4-31B | 60 | 10, 4 KV heads, head dim 512 | 50 sliding window (1024), 16 KV heads, head dim 256 | 81,920 |
 | Qwen-3.6-27B | 64 | 16, 4 KV heads, head dim 256 | 48 Gated DeltaNet (recurrent state, no KV cache) | 65,536 |
 
+**Only these two models' geometry is published.** The four size-scaling models
+carry `source="placeholder"` in the registry, `da models` flags them, and the
+cost model refuses them outright:
+
+```
+$ da roofline --model Qwen/Qwen3.5-4B --attended-tokens 1000 --decode-steps 10
+Qwen/Qwen3.5-4B's attention geometry is a PLACEHOLDER: nobody has verified its
+layer counts or head dims. Derive it from the live config with
+da_vllm.metrics.roofline.geometry_from_config, ...
+```
+
+Derive the real values before you publish anything about those models:
+
+```python
+from transformers import AutoConfig
+from da_vllm.metrics.roofline import geometry_from_config
+from da_vllm.models import get_model
+
+spec = get_model("Qwen/Qwen3.5-9B")
+geometry = geometry_from_config(spec, AutoConfig.from_pretrained(spec.hub_id))
+```
+
 Gemma's global layers use `global_head_dim` and `num_global_key_value_heads` —
 **not** the sliding-window layers' values. Applying the sliding geometry to the
 global layers doubles the byte count; that exact error produced a false finding

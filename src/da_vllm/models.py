@@ -115,9 +115,24 @@ class SamplingSpec:
         }
 
 
+#: Where a geometry's numbers came from.  Only ``"measured"`` and ``"derived"``
+#: may be used in a cost model without an explicit override -- see
+#: :func:`da_vllm.metrics.roofline.roofline_response`.
+GEOMETRY_SOURCES = ("measured", "derived", "placeholder")
+
+
 @dataclass(frozen=True)
 class AttentionGeometry:
-    """Cross-check values.  See module docstring: not the source of truth."""
+    """Cross-check values.  See module docstring: not the source of truth.
+
+    ``source`` is load-bearing.  ``"measured"`` means the numbers were read off
+    the real config or checkpoint and are published; ``"derived"`` means
+    :func:`da_vllm.metrics.roofline.geometry_from_config` produced them from a
+    live config; ``"placeholder"`` means **nobody has verified them** and the
+    cost model refuses to use them.  A 2x error in one of these numbers
+    produced a false finding that took weeks to retract, so an unverified entry
+    fails loudly instead of quietly being wrong.
+    """
 
     num_layers: int
     num_global_layers: int
@@ -136,6 +151,17 @@ class AttentionGeometry:
     #: metadata-builder call for the full-attention group (guide 3).
     observed_full_attention_block: int | None = None
     observed_sliding_window_block: int | None = None
+    source: str = "placeholder"
+
+    def __post_init__(self) -> None:
+        if self.source not in GEOMETRY_SOURCES:
+            raise ValueError(
+                f"geometry source {self.source!r} must be one of {GEOMETRY_SOURCES}"
+            )
+
+    @property
+    def verified(self) -> bool:
+        return self.source != "placeholder"
 
     @property
     def global_kv_bytes_per_token(self) -> int:
@@ -200,9 +226,15 @@ _SPECS: tuple[ModelSpec, ...] = (
             local_bytes_per_step=50 * 1024 * 16 * 256 * 2 * 2,
             observed_full_attention_block=32,
             observed_sliding_window_block=16,
+            source="measured",
         ),
         active_params=31_000_000_000,
     ),
+    # The four size-scaling models below carry PLACEHOLDER geometry: the
+    # published layer counts and head dims cover only the two headline models.
+    # `source="placeholder"` (the default) makes the cost model refuse them
+    # until you derive the real numbers with
+    # `da_vllm.metrics.roofline.geometry_from_config`.
     ModelSpec(
         hub_id="google/gemma-4-12B-it",
         model_type="gemma4_12b",
@@ -258,6 +290,7 @@ _SPECS: tuple[ModelSpec, ...] = (
             # GDN carries a recurrent state, not a KV cache: measured constant.
             local_bytes_per_step=78 * 1024 * 1024,
             observed_full_attention_block=16,
+            source="measured",
         ),
         active_params=27_000_000_000,
     ),

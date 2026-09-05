@@ -23,6 +23,7 @@ built on it, and a "correction" that was itself wrong and had to be retracted.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -125,6 +126,38 @@ def global_kv_bytes_from_shapes(
     return total * 2 * dtype_bytes
 
 
+def geometry_from_config(spec: ModelSpec, config: Any) -> AttentionGeometry:
+    """Derive a usable geometry from a live config.
+
+    This is the recommended path.  The registry is a cross-check; anything it
+    carries that nobody has verified is marked ``source="placeholder"`` and the
+    cost model refuses it.
+    """
+    n_layers, n_global = count_global_layers(config)
+    head_dim = _get(config, "global_head_dim") or _get(config, "head_dim")
+    kv_heads = _get(config, "num_global_key_value_heads") or _get(
+        config, "num_key_value_heads"
+    )
+    # Recompute through the strict path so a hybrid config missing the global
+    # head dims raises here too, rather than silently borrowing sliding values.
+    derived_bytes = global_kv_bytes_per_token(config)
+    g = spec.geometry
+    geometry = dataclasses.replace(
+        g,
+        num_layers=n_layers,
+        num_global_layers=n_global,
+        global_kv_heads=int(kv_heads),
+        global_head_dim=int(head_dim),
+        source="derived",
+    )
+    if geometry.global_kv_bytes_per_token != derived_bytes:  # pragma: no cover
+        raise GeometryError(
+            "internal inconsistency deriving geometry: "
+            f"{geometry.global_kv_bytes_per_token} != {derived_bytes}"
+        )
+    return geometry
+
+
 def verify_geometry(spec: ModelSpec, config: Any) -> None:
     """Cross-check the registry against the live config.  Raises on mismatch."""
     n_layers, n_global = count_global_layers(config)
@@ -168,12 +201,25 @@ def roofline_response(
     peak_bw: float = PEAK_HBM_BYTES_PER_S,
     mfu: float = DECODE_MFU,
     mbu: float = ATTENTION_MBU,
+    allow_placeholder_geometry: bool = False,
 ) -> RooflineBreakdown:
     """Roofline decode wall-time for one whole response.
 
     ``attended_tokens`` is the sum over steps (the DA metric); ``decode_steps``
     multiplies the two context-independent terms.
+
+    Refuses an unverified geometry unless you say so explicitly.  Derive the
+    real numbers with :func:`geometry_from_config` instead: a 2x byte error
+    here produced a false finding, two theories built on it, and a
+    "correction" that was itself wrong.
     """
+    if not geometry.verified and not allow_placeholder_geometry:
+        raise GeometryError(
+            "this model's attention geometry is a PLACEHOLDER -- nobody has "
+            "verified its layer counts or head dims. Derive it from the live "
+            "config with geometry_from_config(spec, hf_config), or pass "
+            "allow_placeholder_geometry=True and do not publish the number."
+        )
     matmul = decode_steps * (2 * active_params) / (peak_flops * mfu)
     global_kv = attended_tokens * geometry.global_kv_bytes_per_token / (peak_bw * mbu)
     local = decode_steps * geometry.local_bytes_per_step / (peak_bw * mbu)

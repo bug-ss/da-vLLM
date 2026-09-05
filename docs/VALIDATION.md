@@ -54,13 +54,25 @@ the two.
 
 ## 4. The kernel honours the mask
 
-`da_vllm.validation.checks.kernel_scaling`
+`da_vllm.validation.capture.MetadataCapture` + `checks.kernel_scaling`
 
 Capture real kernel arguments from the engine, replay them offline, shrink the
-sequence lengths, and check that time scales with the kept fraction. The Triton
-kernel tracked the kept fraction at 91 to 96% efficiency. Capture in **eager
-mode**: a Python monkeypatch on a kernel is bypassed inside a replayed CUDA
-graph.
+sequence lengths, and check that time scales with the kept fraction:
+
+```python
+from da_vllm.validation import MetadataCapture, kernel_scaling, write_capture
+
+with MetadataCapture(limit=64) as capture:   # wraps the DA hook, so what is
+    llm.generate(prompts, params)            # recorded is post-remap state
+write_capture("capture.jsonl", capture.steps)
+
+report = kernel_scaling(run_kernel, kept_fractions=[1.0, 0.5, 0.25])
+assert report.tracks_mask                    # 91-96% on the Triton kernel
+```
+
+Capture in **eager mode**: a Python monkeypatch on a kernel is bypassed inside a
+replayed CUDA graph. And never leave capture on while timing — it copies to the
+host every step.
 
 ## 5. Serve and replay render the same prompt
 

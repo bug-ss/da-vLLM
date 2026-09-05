@@ -221,3 +221,47 @@ def test_sliding_window_detection_falls_back_to_the_attribute():
 
     assert is_sliding_window_spec(Unknown()) is True
     assert is_sliding_window_spec(Other()) is False
+
+
+def test_metadata_capture_records_the_post_remap_state(vllm, tmp_path):
+    """Validation check #4's capture half, against the stand-in vLLM."""
+    from da_vllm.validation.capture import (
+        MetadataCapture,
+        kept_fraction_series,
+        read_capture,
+        write_capture,
+    )
+
+    install_patch(DAConfig(enabled=True), force=True)
+    store = install_shared_mask(2, 256, "cpu", force=True)
+    store.tensor[0].fill_(False)
+    store.tensor[0, :16] = True
+    store.tensor[0, 112:] = True
+
+    capture = MetadataCapture(limit=4)
+    with capture:
+        for _ in range(6):  # more than the limit, on purpose
+            bt = torch.arange(10, 18, dtype=torch.int32).reshape(1, 8)
+            b = _builder(
+                vllm["vllm.v1.attention.backends.flash_attn"].FlashAttentionMetadataBuilder,
+                fake_vllm.FullAttentionSpec(), 16, bt,
+            )
+            b.build(0, _common([128], [1]))
+
+    assert len(capture.steps) == 4
+    # The remap kept 2 of 8 blocks, so the recorded seq_len is the compacted one.
+    assert capture.steps[0].seq_lens == [32]
+    assert kept_fraction_series(capture.steps)[0] <= 1.0
+    assert capture.steps[0].backend == "FlashAttentionMetadataBuilder"
+
+    path = tmp_path / "capture.jsonl"
+    assert write_capture(path, capture.steps) == 4
+    assert [s.step for s in read_capture(path)] == [0, 1, 2, 3]
+
+
+def test_capture_refuses_to_install_before_the_da_patch(vllm):
+    from da_vllm.validation.capture import MetadataCapture
+
+    uninstall_patch()
+    with pytest.raises(RuntimeError, match="install the DA patch first"):
+        MetadataCapture().install()

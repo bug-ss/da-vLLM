@@ -24,38 +24,58 @@ accuracy drops of 1.27pp and 2.75pp.
 ## Install
 
 ```bash
-pip install -e '.[dev]'          # library + tests (CPU only, no GPU needed)
-pip install -e '.[serve]'        # + the pinned torch / vLLM / transformers stack
+pip install -e '.[dev]'                  # library + tests, CPU only
+pip install -r requirements-serve.txt    # the pinned torch / vLLM stack + a GPU
 ```
 
-The pinned serving stack is in [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
-Everything except the vLLM hook itself runs and is tested without a GPU.
+Everything except the vLLM hook itself runs and is tested without a GPU. The
+exact serving stack, including the two dependencies that need special handling,
+is in [requirements-serve.txt](requirements-serve.txt) and
+[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
+
+## Try it with no GPU
+
+```bash
+pytest -q                            # 422 tests, no downloads
+python examples/offline_dryrun.py
+```
+
+The dry run drives the real segmenter, renderer, detector, state machine, mask
+writer and block-table remap against a scripted model, and prints the block
+table shrinking as each mode is declared:
+
+```
+ step     mode  blocks read     of  saving
+    0   global          540    540    0.0%
+   36    focus          126    542   76.8%
+   54    local          111    543   79.6%
+```
 
 ## Quickstart
 
 ```python
-from transformers import AutoTokenizer
-from da_vllm import DAConfig, PromptRenderer
-from da_vllm.serving import EngineOptions, build_llm
-from da_vllm.eval.run import prepare_requests, generate, build_records
+from da_vllm import DAEngine
 
-model = "Qwen/Qwen3.6-27B"
-tokenizer = AutoTokenizer.from_pretrained(model)
-renderer = PromptRenderer(tokenizer, model)          # the ONE renderer
+with DAEngine("Qwen/Qwen3.6-27B") as engine:          # patches vLLM's EngineCore
+    result = engine.answer(long_document, "When was Acme founded?")
 
-config = DAConfig(enabled=True, max_num_seqs=256, max_model_len=262_144)
-options = EngineOptions(model, arm="da", da_config=config)
-llm = build_llm(options)                             # installs the patch in EngineCore
+result.answer            # "2003"
+result.attended_tokens   # KV positions read, summed over decode steps
+result.reduction_pct     # against the analytic vanilla baseline
+result.declines          # focus requests the server refused, and why
 ```
+
+For an agent, wrap it as a tool rather than routing the conversation through it
+— see [docs/USAGE.md](docs/USAGE.md) and `examples/agent_integration.py`.
 
 Command line:
 
 ```bash
-da models                                   # the registry
-da validate --model Qwen/Qwen3.6-27B        # round-trip render/detect/parse
+da validate --model Qwen/Qwen3.6-27B     # round-trip render/detect/parse: run this first
+da segment  --model Qwen/Qwen3.6-27B --context doc.txt
 da render   --model Qwen/Qwen3.6-27B --arm da --context doc.txt --question "When?"
-da score    --model Qwen/Qwen3.6-27B --records runs/records.jsonl
-da roofline --model google/gemma-4-31B-it --attended-tokens 6450000 --decode-steps 435
+da serve-command --model Qwen/Qwen3.6-27B --arm da    # HTTP serving, with the patch
+bash examples/run_eval.sh                             # the full three-arm evaluation
 ```
 
 ## Validate before you believe anything
@@ -70,6 +90,7 @@ column is the only one that proves the mask changed the computation.
 
 | Path | What it is |
 | --- | --- |
+| `src/da_vllm/api.py` | `DAEngine` / `DAAnswer` -- the entry point |
 | `src/da_vllm/segmenter.py` | tokenizer-aware segmenter, character-offset space only |
 | `src/da_vllm/prompt.py` | the one renderer: simulated `get_magic_chunk` transcript |
 | `src/da_vllm/detect.py` | serving-side segment map, from turn and tool boundaries |
@@ -79,13 +100,16 @@ column is the only one that proves the mask changed the computation.
 | `src/da_vllm/masking/patch.py` | the FlashAttention / Triton metadata-builder hook |
 | `src/da_vllm/masking/logits_processor.py` | the driver, running inside EngineCore |
 | `src/da_vllm/metrics/` | attended-token replay, roofline decode wall-time |
-| `src/da_vllm/eval/` | 15 sources, three arms, the fixed judge, macro scoring |
+| `src/da_vllm/eval/` | 15 sources, three arms, rubrics, the fixed judge, macro scoring, the runnable pipeline |
 | `src/da_vllm/validation/` | the checklist, including three-column NLL parity |
 | `src/da_vllm/timing.py` | the wall-clock protocol that held up |
 | `src/da_vllm/training.py` | fine-tuning helpers (not part of the paper's results) |
+| `src/da_vllm/testing.py` | offline tokenizer with real chat templates, for dry runs |
+| `examples/` | offline dry run, quickstart, agent integration, the eval script |
 
 ## Documentation
 
+- [docs/USAGE.md](docs/USAGE.md) — using DA from an agent, serving it over HTTP, running the eval
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how a request flows through the system
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — pinned versions and model-specific facts
 - [docs/EVALUATION.md](docs/EVALUATION.md) — data, arms, judge, metrics, numbers to check against
@@ -95,11 +119,22 @@ column is the only one that proves the mask changed the computation.
 ## Tests
 
 ```bash
-pytest -q          # 360 tests, no GPU required
+pytest -q          # 422 tests, no GPU required
 ```
 
 The suite covers the segmenter's losslessness, prompt/detect round trips
 against adversarial documents on both chat-template families, every state
 machine gate, bit-identity between the two remaps across a randomized sweep,
 the metadata-builder hook against a stand-in vLLM, a full simulated decode
-loop, and the roofline against the paper's projected 0.71x / 0.77x.
+loop, the three-arm evaluation pipeline end to end, the CLI, and the roofline
+against the paper's projected 0.71x / 0.77x.
+
+## One thing to know before you use it
+
+DA is not free on short inputs. The prompt carries a fixed scaffold — the tool
+declaration, a ~1.7K-token instruction, a turn wrapper per magic chunk — and
+roughly half the decode steps run in global mode at that larger prompt length.
+Below a few thousand context tokens DA reads *more* than vanilla; it breaks even
+around 7.5K and reaches −31% by 47K. That is why the evaluation drops contexts
+under 4096 tokens, and why you should route short documents down a plain path.
+[docs/USAGE.md](docs/USAGE.md) has the numbers.
