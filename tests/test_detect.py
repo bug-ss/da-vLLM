@@ -178,3 +178,44 @@ def test_the_configured_question_header_drives_both_render_and_detect(family_cas
         enabled=True, max_model_len=65536
     ))
     assert stale.local_window_is_fallback
+
+
+def test_a_different_prompt_text_of_the_same_length_is_caught(family_case, config, filler):
+    """The count check alone would pass this, and every segment span would then
+    point at the wrong tokens."""
+    hub_id, tok, renderer = family_case
+    real = renderer.render_da(filler, "Who?")
+    # One character changed deep in the document: same token count, different
+    # tokens. Exactly what a stale or mis-plumbed da_prompt_text looks like.
+    decoy_text = real.text.replace("bravo", "brava", 1)
+    assert decoy_text != real.text
+    real_ids = tok.encode(real.text, add_special_tokens=False)
+    assert len(tok.encode(decoy_text, add_special_tokens=False)) == len(real_ids)
+
+    pmap = build_prompt_map(
+        tok, decoy_text, get_model(hub_id).family, config, prompt_token_ids=real_ids
+    )
+    assert pmap.segments == ()
+    assert "does not match the engine's tokens" in pmap.failure_reason
+
+
+def test_an_extra_bos_is_reported_with_the_likely_cause(family_case, config, filler):
+    hub_id, tok, renderer = family_case
+    prompt = renderer.render_da(filler, "Who?")
+    ids = list(tok.encode(prompt.text, add_special_tokens=False))
+    with_bos = [999999] + ids  # what /v1/completions does by default
+    pmap = build_prompt_map(
+        tok, prompt.text, get_model(hub_id).family, config, prompt_token_ids=with_bos
+    )
+    assert pmap.segments == ()
+    assert "add_special_tokens=false" in pmap.failure_reason
+
+
+def test_matching_text_still_passes(family_case, config, filler):
+    hub_id, tok, renderer = family_case
+    prompt = renderer.render_da(filler, "Who?")
+    ids = tok.encode(prompt.text, add_special_tokens=False)
+    pmap = build_prompt_map(
+        tok, prompt.text, get_model(hub_id).family, config, prompt_token_ids=ids
+    )
+    assert pmap.failure_reason is None and pmap.segments

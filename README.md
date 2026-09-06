@@ -1,48 +1,39 @@
 # da-vLLM — Declarative Attention
 
-An implementation of **Declarative Attention (DA)**: a protocol that elicits a
-language model to declare, inside its own chain of thought, where it will
-attend — and a vLLM integration that turns those declarations into a compacted
-KV block table so the stock attention kernel reads fewer pages.
+**The problem.** To write each word of an answer, a language model re-reads the
+entire document. Every word. On a long document that is where the time goes.
 
-Three modes, emitted as ordinary text:
+**The idea.** Let the model say where it needs to look, in its own words, and
+have the server listen. The model writes tags as it thinks:
 
-| Tag | What the model sees |
+| Tag | Means |
 | --- | --- |
-| `<global>` (default) | every magic chunk |
-| `<focus magic_chunks="K">` | only magic chunk K, plus the scaffold |
-| `<local>` / `<answer>` | the scaffold and the response so far, no chunks |
+| `<global>` | I need to see the whole document |
+| `<focus magic_chunks="3">` | I only need chunk 3 right now |
+| `<local>` / `<answer>` | I don't need the document at all, just my own notes |
 
-A **scaffold** — a 16-token attention sink, the question, the DA instruction,
-and the entire response so far — stays attended in every mode. Only the
-context's visibility changes.
+The server reads those tags as they come out and skips the parts of the
+document the model said it doesn't need. Nothing is fetched and nothing is
+deleted — the document stays loaded, it just stops being re-read.
 
-Reported effect, zero-shot on off-the-shelf models across 15 long-context
-sources: attended tokens −52.0% (Gemma-4-31B) and −31.1% (Qwen-3.6-27B), for
-accuracy drops of 1.27pp and 2.75pp.
+This is from the paper *Language Models Can Control Their Own Attention*
+(arXiv:2609.02737). It works on off-the-shelf models with no fine-tuning.
 
-## Install
+**What it buys you.** Across 15 long-document benchmarks: 52% less reading on
+Gemma-4-31B and 31% less on Qwen-3.6-27B, at a cost of 1.3 and 2.8 points of
+accuracy.
 
-```bash
-pip install -e '.[dev]'                  # library + tests, CPU only
-pip install -r requirements-serve.txt    # the pinned torch / vLLM stack + a GPU
-```
-
-Everything except the vLLM hook itself runs and is tested without a GPU. The
-exact serving stack, including the two dependencies that need special handling,
-is in [requirements-serve.txt](requirements-serve.txt) and
-[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md).
-
-## Try it with no GPU
+## Try it without a GPU
 
 ```bash
-pytest -q                            # 434 tests, no downloads
+pip install -e '.[dev]'
+pytest -q                            # 453 tests, no downloads
 python examples/offline_dryrun.py
 ```
 
-The dry run drives the real segmenter, renderer, detector, state machine, mask
-writer and block-table remap against a scripted model, and prints the block
-table shrinking as each mode is declared:
+The dry run uses a fake model but the real segmenter, prompt builder, tag
+reader and masking code. It prints how many memory pages the GPU would read at
+each step:
 
 ```
  step     mode  blocks read     of  saving
@@ -51,107 +42,99 @@ table shrinking as each mode is declared:
    54    local          111    543   79.6%
 ```
 
-## Quickstart
+## Use it
+
+Everything on one machine:
 
 ```python
 from da_vllm import DAEngine
 
-with DAEngine("Qwen/Qwen3.6-27B") as engine:          # patches vLLM's EngineCore
-    result = engine.answer(long_document, "When was Acme founded?")
+with DAEngine("Qwen/Qwen3.6-27B") as engine:
+    r = engine.answer(document, "When was Acme founded?")
 
-result.answer            # "2003"
-result.attended_tokens   # KV positions read, summed over decode steps
-result.reduction_pct     # against the analytic vanilla baseline
-result.declines          # focus requests the server refused, and why
+r.answer            # "2003"
+r.reduction_pct     # how much less the GPU read
+r.declines          # times the model asked to focus and the server said no
 ```
 
-For an agent, wrap it as a tool rather than routing the conversation through it
-— see [docs/USAGE.md](docs/USAGE.md) and `examples/agent_integration.py`.
+App and GPU on different machines:
 
-Command line:
+```python
+from da_vllm import DAClient
+
+client = DAClient("http://gpu-box:8000", "google/gemma-4-31B-it")
+r = client.answer(document, "When was Acme founded?")
+```
+
+See [docs/USAGE.md](docs/USAGE.md) for how to start the server, and for using
+DA as a tool inside an agent.
+
+## Install
 
 ```bash
-da validate --model Qwen/Qwen3.6-27B     # round-trip render/detect/parse: run this first
-da segment  --model Qwen/Qwen3.6-27B --context doc.txt
-da render   --model Qwen/Qwen3.6-27B --arm da --context doc.txt --question "When?"
-da serve-command --model Qwen/Qwen3.6-27B --arm da    # HTTP serving, with the patch
-bash examples/run_eval.sh                             # the full three-arm evaluation
+pip install -e '.[dev]'                  # library and tests, no GPU
+pip install -r requirements-serve.txt    # the pinned vLLM stack, needs a GPU
 ```
 
-## Validate before you believe anything
+Everything except the vLLM hook runs and is tested without a GPU.
 
-The mask in the original work silently did nothing for weeks, and two-column
-NLL checks agreed perfectly the whole time. Run the checklist in
-[docs/VALIDATION.md](docs/VALIDATION.md) before reporting a number. The single
-most important check is three-column NLL parity (`v ~ d < dv`) — the `dv`
-column is the only one that proves the mask changed the computation.
+## Read this before you use it
+
+**DA costs something on short documents.** It adds about 2,700 tokens to every
+prompt and makes the model write about a third more words. That cost is fixed;
+the saving grows with document size. Below a few thousand tokens DA reads
+*more* than normal. It breaks even around 7,500 tokens and reaches 31% cheaper
+by 47,000. Send short documents down your normal path.
+
+**It does not make answers better.** Accuracy drops slightly. "Focus" describes
+where the machine reads from, not the model concentrating harder. If you want
+better answers on long documents, this is the wrong lever.
+
+**It has never run on a GPU here.** The vLLM integration was written against
+the real vLLM 0.20.2 source and matches it, and the tests check that — but no
+kernel has actually executed. Run the checks in
+[docs/VALIDATION.md](docs/VALIDATION.md) before trusting any number.
+
+## Docs
+
+| | |
+| --- | --- |
+| [ORIENTATION.md](docs/ORIENTATION.md) | what every file does, in plain language — **start here** |
+| [USAGE.md](docs/USAGE.md) | running it, including across two machines |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | how it works inside |
+| [VALIDATION.md](docs/VALIDATION.md) | how to prove it is actually working |
+| [EVALUATION.md](docs/EVALUATION.md) | reproducing the paper's numbers |
+| [ENVIRONMENT.md](docs/ENVIRONMENT.md) | versions, model facts, GPU setup |
+| [PITFALLS.md](docs/PITFALLS.md) | every known way this breaks, and what stops it |
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `src/da_vllm/api.py` | `DAEngine` / `DAAnswer` -- the entry point |
-| `src/da_vllm/segmenter.py` | tokenizer-aware segmenter, character-offset space only |
-| `src/da_vllm/prompt.py` | the one renderer: simulated `get_magic_chunk` transcript |
-| `src/da_vllm/detect.py` | serving-side segment map, from turn and tool boundaries |
-| `src/da_vllm/state_machine.py` | tag detection, mode transitions, mask construction |
-| `src/da_vllm/masking/shared.py` | the shared `(max_num_seqs, max_model_len)` mask |
-| `src/da_vllm/masking/remap.py` | block-table remap: readable reference + sync-free version |
-| `src/da_vllm/masking/patch.py` | the FlashAttention / Triton metadata-builder hook |
-| `src/da_vllm/masking/logits_processor.py` | the driver, running inside EngineCore |
-| `src/da_vllm/metrics/` | attended-token replay, roofline decode wall-time |
-| `src/da_vllm/eval/` | 15 sources, three arms, rubrics, the fixed judge, macro scoring, the runnable pipeline |
-| `src/da_vllm/validation/` | the checklist, including three-column NLL parity |
-| `src/da_vllm/timing.py` | the wall-clock protocol that held up |
-| `src/da_vllm/training.py` | fine-tuning helpers (not part of the paper's results) |
-| `src/da_vllm/testing.py` | offline tokenizer with real chat templates, for dry runs |
-| `examples/` | offline dry run, quickstart, agent integration, the eval script |
-
-## Documentation
-
-- [docs/ORIENTATION.md](docs/ORIENTATION.md) — plain-language map of every part of the repo, start here
-- [docs/USAGE.md](docs/USAGE.md) — using DA from an agent, serving it over HTTP, running the eval
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how a request flows through the system
-- [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — pinned versions and model-specific facts
-- [docs/EVALUATION.md](docs/EVALUATION.md) — data, arms, judge, metrics, numbers to check against
-- [docs/VALIDATION.md](docs/VALIDATION.md) — the checklist
-- [docs/PITFALLS.md](docs/PITFALLS.md) — every known failure and where this code prevents it
-
-## Verified against real vLLM
-
-The integration was written from the guide and then **checked line by line
-against the actual `vllm==0.20.2` source**. That found four things it had
-wrong, all of which would have failed on a real GPU: the logits-processor FQCN
-separator (`module:qualname`, not dotted), the runner's cached
-`update_block_table` path pairing a compacted `seq_lens` with an uncompacted
-block table, CUDA-graph capture running through `build()`, and a `num_stages`
-tweak aimed at a kernel that 0.20.2 had already unified away. Plus one polarity
-bug of my own: "is this a sliding-window spec?" answers *no* for a rotating
-cache it has never heard of.
-
-`docs/ARCHITECTURE.md` lists exactly which vLLM files were read and what each
-one confirmed or corrected, and `tests/fake_vllm.py` mirrors the real
-signatures so the tests check the contract rather than an assumption.
+| `api.py` | `DAEngine` — the main entry point |
+| `client.py` | `DAClient` — same thing, over HTTP |
+| `segmenter.py` | splits a document into numbered chunks |
+| `prompt.py` | builds the prompt (the only place that does) |
+| `detect.py` | server side: finds where each chunk sits |
+| `state_machine.py` | watches for tags, decides what stays visible |
+| `masking/` | the GPU side: the mask, and the vLLM hook |
+| `metrics/` | counts what was saved |
+| `eval/` | the 15-benchmark harness |
+| `validation/` | checks that the masking really happens |
+| `timing.py` | how to benchmark this honestly |
+| `training.py` | notes for fine-tuning on DA traces |
+| `testing.py` | fake tokenizer, so everything runs offline |
+| `examples/` | dry run, quickstart, agent integration, remote client, benchmark script |
 
 ## Tests
 
 ```bash
-pytest -q          # 434 tests, no GPU required
+pytest -q          # 453 tests, no GPU
 ```
 
-The suite covers the segmenter's losslessness, prompt/detect round trips
-against adversarial documents on both chat-template families, every state
-machine gate, bit-identity between the two remaps across a randomized sweep,
-the metadata-builder hook against a stand-in vLLM, a full simulated decode
-loop, the three-arm evaluation pipeline end to end, the CLI, and the roofline
-against the paper's projected 0.71x / 0.77x.
-
-## One thing to know before you use it
-
-DA is not free on short inputs. The prompt carries a fixed scaffold — the tool
-declaration, a ~1.7K-token instruction, a turn wrapper per magic chunk — and
-roughly half the decode steps run in global mode at that larger prompt length.
-Below a few thousand context tokens DA reads *more* than vanilla; it breaks even
-around 7.5K and reaches −31% by 47K. That is why the evaluation drops contexts
-under 4096 tokens, and why you should route short documents down a plain path.
-[docs/USAGE.md](docs/USAGE.md) has the numbers.
+They cover: documents survive being split and rejoined; prompts survive the
+round trip on both chat-template families, including documents written to
+confuse the parser; every path through the tag reader; the fast and slow
+masking code producing byte-identical output; the vLLM hook against a stand-in
+built from the real vLLM source; a full simulated decode loop; the HTTP client;
+and the cost model reproducing the paper's projections.

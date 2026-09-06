@@ -189,6 +189,58 @@ def detect_segments(
     return spans, None
 
 
+def _verify_against_engine(
+    tokenizer,
+    prompt_text: str,
+    prompt_token_ids: Sequence[int] | None,
+    num_rendered: int,
+) -> str | None:
+    """Check the text we are about to detect over IS the text the engine has.
+
+    Every segment span is a *token offset* into the engine's prompt.  If the
+    text we detect over is not byte-for-byte what the engine tokenized, those
+    offsets point at the wrong tokens and the mask keeps the wrong region --
+    the model answers from whatever happened to land there, confidently and
+    wrongly.
+
+    Comparing token counts is not enough: a different string of the same
+    length passes.  So the ids themselves are compared.  It costs one list
+    comparison per request, once, and it is the difference between a wrong
+    answer and a declined focus.
+    """
+    if prompt_token_ids is None:
+        logger.warning(
+            "da: the engine did not supply prompt token ids, so the prompt "
+            "text could not be verified. Segment spans are being trusted "
+            "unchecked -- if the text differs from what the engine tokenized, "
+            "the mask will keep the wrong tokens."
+        )
+        return None
+
+    engine_ids = list(prompt_token_ids)
+    if num_rendered != len(engine_ids):
+        return (
+            f"tokenization mismatch: detector sees {num_rendered} tokens, engine "
+            f"has {len(engine_ids)}. Common cause: the prompt was sent as a "
+            "string to /v1/completions, which adds a second BOS by default -- "
+            "pass add_special_tokens=false, or send token ids."
+        )
+
+    ours = list(tokenizer.encode(prompt_text, add_special_tokens=False))
+    if ours != engine_ids:
+        first = next(
+            (i for i, (a, b) in enumerate(zip(ours, engine_ids)) if a != b),
+            0,
+        )
+        return (
+            f"prompt text does not match the engine's tokens (first difference "
+            f"at token {first}). The text handed to the detector is not the "
+            "text the engine is serving; render once and use the same string "
+            "for both."
+        )
+    return None
+
+
 def build_prompt_map(
     tokenizer,
     prompt_text: str,
@@ -207,12 +259,7 @@ def build_prompt_map(
     num_tokens = len(prompt_token_ids) if prompt_token_ids is not None else len(starts)
     sink_end = min(config.sink_tokens, num_tokens)
 
-    reason: str | None = None
-    if prompt_token_ids is not None and len(starts) != len(prompt_token_ids):
-        reason = (
-            f"tokenization mismatch: renderer {len(starts)} tokens vs engine "
-            f"{len(prompt_token_ids)}"
-        )
+    reason = _verify_against_engine(tokenizer, prompt_text, prompt_token_ids, len(starts))
 
     # -- local window ------------------------------------------------------
     # Searched over the prompt region only.  A marker search that ran over the

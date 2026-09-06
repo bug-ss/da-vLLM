@@ -1,6 +1,7 @@
-# Environment
+# Versions, models and GPU setup
 
-Resolved versions the reported results were produced with.
+The exact versions the published results came from, plus the model-specific
+facts you need if you are adding a model.
 
 | Component | Version |
 | --- | --- |

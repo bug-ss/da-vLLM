@@ -1,132 +1,138 @@
-# Validation checklist
+# Checking that DA is actually working
 
-**This is not optional.** The mask silently did nothing for weeks in the work
-this reproduces, and the obvious checks all passed the whole time. Run these
-before reporting a number.
+Read this before you believe any number.
 
-## 1. Three-column NLL parity
+In the original work, **the masking silently did nothing for weeks**. The
+server ran, the answers looked fine, and the obvious checks all passed. The
+only thing that caught it was check 1 below.
+
+That is the failure mode to worry about here. Not a crash — a system that looks
+healthy and is quietly doing nothing.
+
+## Check 1 — is the mask changing the answer at all?
 
 `da_vllm.validation.nll_parity.three_column_parity`
 
-For each prompt: greedy-decode with vanilla attention and with DA. Then
-teacher-force in HuggingFace three ways, recording per-token NLL on the
-completion:
+The idea: score the same text three ways and see if the numbers line up the way
+they should.
 
-| column | response | mask |
+Take one document and one question. Generate an answer twice — once normally,
+once with DA. Then score both answers with a separate copy of the model, three
+ways:
+
+| | which answer | what it could see |
 | --- | --- | --- |
-| `v` | vanilla response | causal |
-| `d` | DA response | the 4D DA mask |
-| `dv` | DA response | plain causal |
+| **v** | the normal one | everything |
+| **d** | the DA one | only what DA allowed |
+| **dv** | the DA one | everything |
 
-Require **`v ~ d < dv`**.
+You need **v ≈ d, and both below dv**.
 
-Two columns are not enough. When the patch was silently not applied, `v` and `d`
-agreed perfectly — that is what a no-op looks like. The `dv` column is the only
-one that proves the mask changed the computation: the DA response must be *less*
-likely under full attention than under the mask it was generated with.
+Here is why. `v ≈ d` says DA's answer is about as good as the normal one. And
+`d < dv` says the DA answer makes *more* sense under the restricted view than
+under the full view — which can only be true if the restriction was real.
 
-Two properties the HF reference must have, or it diverges by an order of
-magnitude:
+**Two columns are not enough.** When the mask was broken, v and d matched
+perfectly and everything looked fine. The `dv` column is the one that proves
+anything happened.
 
-- it OR-reduces the KV dimension at the **served block size**
-  (`block_align_mask`), matching the engine's outward rounding;
-- on hybrid models it passes a **per-layer-type** mask (`per_layer_masks`): the
-  DA mask on full-attention layers, the sliding mask on sliding-window layers.
+Two things the scoring copy must get right, or the numbers are meaningless:
 
-Expect a baseline gap of 0.05 to 0.15 nats between vLLM and HF from bf16 drift.
-`ParityResult.explain()` names which of the two conditions failed.
+- Round the mask out to the same block size the server uses. The GPU reads in
+  fixed-size blocks, so a mask that doesn't align to them isn't the same mask.
+- On models with mixed layer types (Gemma), give each layer type its own mask.
+  A single mask for the whole model is wrong by a factor of ten.
 
-## 2. Decoded text inspection
+Expect the two systems to disagree by 0.05–0.15 anyway, from normal
+floating-point drift. `ParityResult.explain()` tells you which condition failed.
 
-Read the generated text, every time. Low NLL with garbage text is the signature
-of corrupted KV in a layer the harness cannot see — the symptom that turned out
-to be the shared `seq_lens` being shrunk in place for the full-attention group,
-which corrupted the sliding-window group's kernel on Gemma.
+## Check 2 — read the answers
 
-## 3. Realized kept fraction
+Every time. Low scores with garbage text means the cache is corrupted in a
+layer the scoring harness cannot see. This is what it looked like when the
+sequence-length tensor was being shared between layer groups.
 
-Set `DAConfig(log_kept_fraction=True)` to log the actual kept-over-total block
-ratio from inside the remap, and compare it with the token-level metric via
-`validation.checks.kept_fraction_report`. The block figure must be the larger of
-the two.
+## Check 3 — does the saving you measure match the saving you claim?
 
-**This adds a host-device sync. Never leave it on while timing.**
+Set `DAConfig(log_kept_fraction=True)` and the server logs how many memory
+blocks it actually skipped. Compare against what
+`da_vllm.metrics.replay` calculated from the text.
 
-## 4. The kernel honours the mask
+The measured one should be slightly *larger*, because the GPU reads whole
+blocks and the calculation counts individual tokens.
 
-`da_vllm.validation.capture.MetadataCapture` + `checks.kernel_scaling`
+**Turn this off before timing anything.** It forces the GPU and CPU to
+sync every step, which is exactly what the fast path avoids.
 
-Capture real kernel arguments from the engine, replay them offline, shrink the
-sequence lengths, and check that time scales with the kept fraction:
+## Check 4 — does reading less actually take less time?
 
 ```python
 from da_vllm.validation import MetadataCapture, kernel_scaling, write_capture
 
-with MetadataCapture(limit=64) as capture:   # wraps the DA hook, so what is
-    llm.generate(prompts, params)            # recorded is post-remap state
+with MetadataCapture(limit=64) as capture:
+    llm.generate(prompts, params)
 write_capture("capture.jsonl", capture.steps)
 
 report = kernel_scaling(run_kernel, kept_fractions=[1.0, 0.5, 0.25])
-assert report.tracks_mask                    # 91-96% on the Triton kernel
+assert report.tracks_mask          # 91-96% on the Triton kernel in the paper
 ```
 
-Capture in **eager mode**: a Python monkeypatch on a kernel is bypassed inside a
-replayed CUDA graph. And never leave capture on while timing — it copies to the
-host every step.
+Record what the GPU was actually asked to do, replay it offline with smaller
+inputs, and check the time drops in proportion.
 
-## 5. Serve and replay render the same prompt
+Capture with CUDA graphs off. A Python hook is skipped inside a replayed graph,
+so a captured graph tells you nothing.
 
-`da_vllm.validation.checks.assert_prompt_parity`
+## Check 5 — does the server see the prompt the app wrote?
 
-Token for token, by fingerprint. Serve and replay once differed by the
-tool-declaration system block — about 340 tokens on Qwen — so the reported
-metrics described a prompt the model never saw. Every render path in this
-repository goes through `PromptRenderer`; the assertion is what keeps it that
-way.
+`assert_prompt_parity` compares a hash of the two.
 
-## 6. Round trip, per family
+These once differed by about 340 tokens — a block of tool definitions present
+on one side and not the other. Every reported number described a prompt the
+model never saw.
 
-`da_vllm.validation.checks.round_trip` / `da validate --model <model>`
-
-Render, detect, parse — over adversarial contexts:
-
-- a document containing `# Question`;
-- a document containing `Magic Chunk 7`;
-- a document containing the family's own turn literal;
-- a document containing DA tags;
-- short, empty, and whitespace-only contexts;
-- a whitespace-free run that cannot be split.
-
-Each case asserts that the number of segments rendered equals the number
-detected, that ids are exactly 1..N, that the local window did not fall back,
-and that a `<focus>` tag parses.
-
-## 7. A/B inside one engine boot
-
-`da_vllm.validation.checks.StepToggle`
-
-Alternate the two variants step by step within a single boot. Cross-boot
-variance (0.3 to 0.5 ms) is larger than the effects being measured, so an A/B
-across two process launches proves nothing.
-
-## 8. Remap equivalence
-
-`tests/test_remap.py`
-
-Every optimized variant must produce **bit-identical** `block_table[0:seq_len]`
-and `seq_lens` against the readable version, across a sweep of batch sizes,
-block sizes, sequence lengths and prune patterns, including R = 0, narrow block
-tables, and sequence length above `max_model_len`.
-
-Do **not** use generated-token identity as the test: differently shaped
-transient tensors change allocator state, last-bit logits differ, and greedy
-argmax flips even when the remap is a verified no-op.
-
-## Quick run
+## Check 6 — round trip, per model family
 
 ```bash
-pytest -q                                    # everything that needs no GPU
-da validate --model Qwen/Qwen3.6-27B         # checks 5 and 6 against the real tokenizer
+da validate --model <your-model>
 ```
 
-Checks 1, 3 and 4 need a GPU and a served model.
+Builds a prompt, then has the server-side code read it back, over deliberately
+awkward documents:
+
+- one containing the text `# Question`
+- one containing a fake `Magic Chunk 7` header
+- one containing the model's own turn markers
+- one containing DA tags
+- empty, whitespace-only, and one long word with no spaces
+
+Each case checks the server found exactly the chunks the app wrote.
+
+**Run this first on any new model.** It is quick and it catches broken chat
+templates, which are otherwise invisible.
+
+## Check 7 — A/B inside one server start
+
+`StepToggle` alternates two variants step by step in a single run.
+
+Restarting the server changes timings by 0.3–0.5 ms on its own, which is more
+than most of the effects being measured. Comparing across two restarts proves
+nothing.
+
+## Check 8 — the fast masking code matches the slow one
+
+`tests/test_remap.py` runs both over random batch sizes, block sizes, document
+lengths and mask patterns, and requires **byte-identical** output.
+
+Do not test this by comparing generated text. Differently shaped temporary
+arrays shift memory allocation, the last bit of a probability changes, and the
+chosen word flips — even when the masking provably did nothing.
+
+## Quick version
+
+```bash
+pytest -q                                # everything that needs no GPU
+da validate --model <your-model>         # checks 5 and 6, real tokenizer
+```
+
+Checks 1, 3 and 4 need a GPU and a running model.

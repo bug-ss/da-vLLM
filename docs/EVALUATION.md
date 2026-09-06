@@ -1,4 +1,7 @@
-# Evaluation
+# Reproducing the paper's numbers
+
+Only needed if you want to check the published results. Skip this entirely if
+you just want DA working in your own application.
 
 ## Data
 

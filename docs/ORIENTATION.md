@@ -18,7 +18,8 @@ Everything in `src/da_vllm/` is one of three things: **preparing the prompt**,
 
 | File | What it is |
 | --- | --- |
-| `api.py` | The front door. `DAEngine("model").answer(document, question)` → an answer plus how much attention it saved. If you only read one file, read this one. |
+| `api.py` | The front door. `DAEngine("model").answer(document, question)` → an answer plus how much reading it saved. If you only read one file, read this one. |
+| `client.py` | The same thing when the GPU is on another machine. `DAClient("http://gpu-box:8000", "model")`. |
 | `examples/offline_dryrun.py` | Runs the whole thing on your laptop with no GPU and no model download. Best way to see what's going on. |
 | `cli.py` | The `da` command. Inspect prompts, check your setup, run the evaluation. |
 | `config.py` | Every knob, in one dataclass. Unknown keys raise instead of being ignored. |
@@ -241,8 +242,9 @@ Skip all of this if you just want DA in your own application.
 
 ## Three ways you might use this
 
-**Just want the speedup in your app** → `api.py`, `config.py`, `models.py`.
-Read `docs/USAGE.md`. Ignore `eval/` entirely.
+**Just want the speedup in your app** → `api.py` (or `client.py` if the GPU is
+on another machine), `config.py`, `models.py`. Read `docs/USAGE.md`. Ignore
+`eval/` entirely.
 
 **Want to know how it works** → `examples/offline_dryrun.py`, then
 `state_machine.py`, then `masking/remap.py`. `docs/ARCHITECTURE.md` has the

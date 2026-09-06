@@ -1,4 +1,7 @@
-# Architecture
+# How it works inside
+
+This is the "what is actually happening" document. For "what should I run", see
+[USAGE.md](USAGE.md); for "what is this file", see [ORIENTATION.md](ORIENTATION.md).
 
 ## The flow of one request
 
@@ -48,10 +51,11 @@ and `eval.score` aggregates macro over the 15 sources.
 A request's mask is a boolean row over KV positions. Three regions are kept in
 **every** non-global mode:
 
-1. **Attention sink** — prompt tokens `[0, 16)`, StreamingLLM style. This is
-   why the system turn exists: without a content-free preamble at the front, a
-   context token lands in the sink, and without the sink at all, long-context
-   decoding degenerates into `<local>` loops.
+1. **The first 16 tokens.** Models need *something* at the very start to stay
+   coherent — take it away and long answers collapse into repeating `<local>`
+   forever. This is why the prompt opens with a throwaway "You are a helpful
+   assistant": those 16 tokens are permanently visible, so they must not be
+   document content.
 2. **Local window** — from the last occurrence of the question header to the
    end of the prompt, assistant header included. Falls back to the last 1024
    prompt tokens if the marker is missing, and logs a warning when it does. The
@@ -59,10 +63,10 @@ A request's mask is a boolean row over KV positions. Three regions are kept in
    the detector reads, so the two cannot diverge; the search is bounded to the
    prompt region, because running it over the model's own output was one of the
    silent bugs.
-3. **The response** — every position from `prompt_len` onward, unconditionally,
-   including tokens not yet generated. The boundary never moves, so a token
-   written after the mask was frozen can never fall out of it, and a row only
-   needs rewriting when the mode changes.
+3. **Everything the model has written, and everything it will write.** The
+   cut-off point never moves, so a word written after the mask was set can
+   never accidentally fall outside it. It also means the mask only has to be
+   rewritten when the mode changes, not every step.
 
 `FOCUS` adds the named segment spans. `LOCAL` adds nothing. `GLOBAL` is the
 all-True row.
@@ -71,17 +75,18 @@ Every region is written through one function (`_MaskWriter.keep`) that feeds
 both the dense mask and the span list, so the GPU writer and the reference mask
 cannot drift apart.
 
-### Block alignment
+### Rounding out to whole blocks
 
-Kept spans are rounded **outward** to KV block boundaries: a block is kept if
-any position in it is kept. The cost is at most one extra block per span edge —
-a few dozen tokens against a 2048-token segment. The tail block containing the
-token just written is always kept; compacting past it makes the kernel unable to
-see the current token's own key and the model loses coherence within a few
-steps.
+The GPU stores the document in fixed-size blocks (16 or 32 tokens) and reads
+whole blocks at a time. So a kept range is widened outwards until it lines up
+with block edges — keep a block if any part of it is wanted. That costs at most
+one extra block at each end, a few dozen tokens against a 2,048-token chunk.
 
-Nothing is ever evicted. DA reduces bytes *read*, not bytes *stored*, and gives
-no batch-capacity benefit.
+The block holding the word being written right now is always kept. Drop it and
+the model cannot see its own last word, and it falls apart within a few steps.
+
+Nothing is ever thrown away. DA reduces how much is *read*, not how much is
+*stored*. It does not free up room for more concurrent requests.
 
 ## Tag detection
 
@@ -119,15 +124,17 @@ Focus parsing declines on any doubt — a syntax error, an empty list, an unknow
 id, more than three ids, or a prompt with no detected segments — and records the
 reason. A declined focus costs efficiency; a wrong focus corrupts the answer.
 
-## The one-step lag
+## Why the mask is always slightly behind
 
-vLLM samples on the GPU and copies tokens back asynchronously, so when the state
-machine runs before step *k* the token from step *k-1* may still be the
-placeholder `-1`. The walk stops at the first negative id and revisits it next
-step, which means the mask applied at step *k* reflects the text through step
-*k-2*. This is symmetric in both directions, and the scaffold part of the mask
-is mode-invariant, so a stale mask never drops something the current token
-needs. `metrics.replay` reproduces the same lag by default.
+The GPU picks the next word and copies it back to the CPU in the background, so
+when DA looks at the output the most recent word is sometimes not there yet
+(it shows up as a placeholder, `-1`). DA stops at the first placeholder and
+looks again next step.
+
+The effect is that the mask is about two words behind the text. That is safe:
+the always-visible parts are the same in every mode, so a slightly stale mask
+never hides something the current word needs. The measurement code reproduces
+the same lag, so the numbers match what really happened.
 
 ## Where the code runs
 

@@ -45,9 +45,33 @@ from .serving import EngineOptions
 
 logger = logging.getLogger(__name__)
 
-GenerateFn = Callable[
-    [Sequence[Sequence[int]], dict], Sequence[tuple[str, Sequence[int], "str | None"]]
-]
+
+def _accepts_prompts(fn: "GenerateFn | None") -> bool:
+    """True if ``fn`` wants the rendered prompts as a third argument."""
+    if fn is None:
+        return False
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # builtins, C callables
+        return False
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params.values()):
+        return True
+    positional = [
+        p
+        for p in params.values()
+        if p.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(positional) >= 3
+
+#: ``generate_fn(token_id_lists, sampling_params)`` -> one
+#: ``(text, token_ids, finish_reason)`` per prompt.  It may take an optional
+#: third argument, ``prompts``, to receive the matching
+#: :class:`RenderedPrompt` objects -- a remote backend needs the prompt text to
+#: send alongside the ids.
+GenerateFn = Callable[..., Sequence[tuple[str, Sequence[int], "str | None"]]]
 
 
 @dataclass
@@ -145,6 +169,7 @@ class DAEngine:
         )
         self._llm = llm
         self._generate_fn = generate_fn
+        self._generate_fn_takes_prompts = _accepts_prompts(generate_fn)
         self._prompt_map_cache: dict[str, PromptMap] = {}
 
     # -- construction helpers ---------------------------------------------
@@ -196,7 +221,11 @@ class DAEngine:
     ) -> list[tuple[str, list[int], str | None]]:
         params = self.sampling_params()
         if self._generate_fn is not None:
-            out = self._generate_fn(token_id_lists, params)
+            out = (
+                self._generate_fn(token_id_lists, params, prompts)
+                if self._generate_fn_takes_prompts
+                else self._generate_fn(token_id_lists, params)
+            )
             return [(t, list(ids), fr) for t, ids, fr in out]
 
         from vllm import SamplingParams  # type: ignore

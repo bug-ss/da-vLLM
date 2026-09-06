@@ -1,7 +1,10 @@
-# Pitfalls, and where this code prevents each one
+# Every known way this breaks
 
-Every row is a failure the original work actually hit. The right-hand column is
-where this repository makes it hard to repeat.
+Each row is something that actually went wrong — in the original work, or here.
+The right-hand column is what stops it happening again.
+
+Most of these are not crashes. They are things that look fine and are quietly
+wrong, which is why so much of this codebase is checks and refusals.
 
 ## Silent no-ops — the worst class
 
