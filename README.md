@@ -109,6 +109,7 @@ column is the only one that proves the mask changed the computation.
 
 ## Documentation
 
+- [docs/ORIENTATION.md](docs/ORIENTATION.md) — plain-language map of every part of the repo, start here
 - [docs/USAGE.md](docs/USAGE.md) — using DA from an agent, serving it over HTTP, running the eval
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how a request flows through the system
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — pinned versions and model-specific facts
