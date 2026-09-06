@@ -26,6 +26,58 @@ Everything in `src/da_vllm/` is one of three things: **preparing the prompt**,
 
 ---
 
+## Which process each part runs in
+
+This trips people up, so it is worth being explicit. There are two processes,
+even when you only launch one program: vLLM always runs the model in a separate
+`EngineCore` subprocess.
+
+```
+YOUR PROCESS (your agent)                 vLLM EngineCore SUBPROCESS
+──────────────────────────                ──────────────────────────
+segmenter.py    chop the document
+prompt.py       write the prompt
+                tokenize
+                        │
+                        │  token ids  +  extra_args{da_enable, da_prompt_text}
+                        └──────────────────────►
+                                                  logits_processor.py  (driver)
+                                                  detect.py     find the chunks
+                                                  state_machine.py  watch tags
+                                                  shared.py     write the mask
+                                                  patch.py ─┐
+                                                  remap.py ─┴ shrink the read
+                                                            │
+                        ◄───────────────────────────────────┘
+                             generated text
+metrics/replay.py   count what it saved
+eval/judge.py       grade the answer
+```
+
+**`segmenter.py` and `prompt.py` are yours.** They run wherever you call
+`DAEngine.answer()` — your agent, your script, your web handler. The engine
+never imports them. You can run them with no GPU and no vLLM installed at all;
+that is exactly what `da segment` and `da render` do.
+
+**`detect.py` and everything in `masking/` are the engine's.** They run inside
+the subprocess, on every decode step.
+
+One deliberate wrinkle: the chunk boundaries the segmenter computed are **not**
+sent to the server. The server re-derives them itself from the prompt text with
+`detect.py`. It looks redundant, and it is on purpose — the serving side never
+trusts a client-supplied map of where the chunks are. If the two disagree, the
+server declines focus mode rather than masking the wrong tokens. (You may pass
+the rendered prompt *string* through `extra_args` to save the server a slow
+detokenize, but it still does its own detection on it, and cross-checks the
+token count.)
+
+If you serve over HTTP instead of in-process, the split is the same — the left
+column is your client, the right column is the `vllm serve` process. The mask
+only exists where `patch.py` is installed, which is why
+`da serve-command` exists.
+
+---
+
 ## Phase 1 — turning a document into a prompt
 
 This all happens before the model generates anything.
