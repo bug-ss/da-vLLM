@@ -126,7 +126,9 @@ def global_kv_bytes_from_shapes(
     return total * 2 * dtype_bytes
 
 
-def geometry_from_config(spec: ModelSpec, config: Any) -> AttentionGeometry:
+def geometry_from_config(
+    spec: ModelSpec, config: Any, *, local_bytes_per_step: int | None = None
+) -> AttentionGeometry:
     """Derive a usable geometry from a live config.
 
     This is the recommended path.  The registry is a cross-check; anything it
@@ -142,12 +144,24 @@ def geometry_from_config(spec: ModelSpec, config: Any) -> AttentionGeometry:
     # head dims raises here too, rather than silently borrowing sliding values.
     derived_bytes = global_kv_bytes_per_token(config)
     g = spec.geometry
+    if local_bytes_per_step is None and not g.verified:
+        raise GeometryError(
+            f"{spec.hub_id}: the config gives the global-layer geometry, but "
+            "local_bytes_per_step is still a placeholder. That term is the "
+            "sliding-window or recurrent read, which the config does not state "
+            "-- derive it and pass local_bytes_per_step=, or the roofline's "
+            "local term is a guess wearing a 'derived' label."
+        )
     geometry = dataclasses.replace(
         g,
         num_layers=n_layers,
         num_global_layers=n_global,
         global_kv_heads=int(kv_heads),
         global_head_dim=int(head_dim),
+        local_bytes_per_step=(
+            g.local_bytes_per_step if local_bytes_per_step is None
+            else int(local_bytes_per_step)
+        ),
         source="derived",
     )
     if geometry.global_kv_bytes_per_token != derived_bytes:  # pragma: no cover

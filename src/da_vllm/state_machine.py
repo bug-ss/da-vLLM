@@ -247,6 +247,13 @@ class DAStateMachine:
         self.stats = RequestStats()
         self._detok = IncrementalDetokenizer(tokenizer)
         self._tail = ""
+        self._new_text = ""
+        self._chars_seen = 0
+        #: Absolute character offset of the last tag acted on.  The regexes are
+        #: tail-anchored with a few characters of slack, so the same tag matches
+        #: again on the next token that contains ">" -- which would count one
+        #: declined <focus> several times in the published attempt rate.
+        self._last_tag_at = -1
         self._consumed = 0
         self._patterns = tag_patterns(config.tag_tail_slack)
         self._snapshot = build_mask(prompt_map, Mode.GLOBAL)
@@ -257,6 +264,15 @@ class DAStateMachine:
     def num_consumed(self) -> int:
         """Generated tokens the state machine has actually seen."""
         return self._consumed
+
+    def take_new_text(self) -> str:
+        """Text decoded since the last call.
+
+        The state machine already detokenizes incrementally; this hands the
+        same text to the runaway detector instead of decoding it twice.
+        """
+        text, self._new_text = self._new_text, ""
+        return text
 
     def snapshot(self) -> MaskSnapshot:
         return self._snapshot
@@ -287,6 +303,8 @@ class DAStateMachine:
             i += 1
             if not delta:
                 continue
+            self._new_text += delta
+            self._chars_seen += len(delta)
             self._tail = (self._tail + delta)[-2 * self.config.detect_scan_chars:]
             if ">" not in delta:
                 continue
@@ -299,17 +317,23 @@ class DAStateMachine:
 
     def _scan(self, step: int) -> bool:
         tail = self._tail[-self.config.detect_scan_chars:]
+        tail_origin = self._chars_seen - len(tail)
         hits: list[tuple[int, str, re.Match[str]]] = []
         for kind, pattern in self._patterns:
             m = pattern.search(tail)
-            if m is not None:
-                hits.append((m.start(), kind, m))
+            if m is None:
+                continue
+            at = tail_origin + m.start()
+            if at <= self._last_tag_at:
+                continue  # already acted on this exact tag
+            hits.append((at, kind, m))
         if not hits:
             return False
         hits.sort(key=lambda h: h[0])
 
         changed = False
-        for _, kind, m in hits:
+        for at, kind, m in hits:
+            self._last_tag_at = max(self._last_tag_at, at)
             if self._transition(kind, m, step):
                 changed = True
         return changed

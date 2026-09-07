@@ -16,6 +16,15 @@ from typing import Any, Iterable, Iterator
 ARMS = ("vanilla", "da_no_mask", "da")
 
 
+def new_run_id(model: str, arm: str) -> str:
+    """A unique label for one arm's generation run."""
+    import uuid
+
+    from ..models import resolve
+
+    return f"{resolve(model).hub_id.replace('/', '_')}-{arm}-{uuid.uuid4().hex[:8]}"
+
+
 @dataclass
 class ResponseRecord:
     run_id: str

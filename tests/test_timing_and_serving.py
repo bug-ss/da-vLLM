@@ -95,3 +95,25 @@ def test_worker_env_puts_sitecustomize_on_the_path_and_forces_spawn():
     assert "/existing" in env["PYTHONPATH"]
     assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
     assert "DA_VLLM_CONFIG" in env
+
+
+def test_a_false_boolean_becomes_an_explicit_no_flag():
+    """vLLM's default for prefix caching is ON. Omitting the flag when the
+    caller asked for False would measure DA against a cached baseline, which
+    is item 1 of the timing checklist."""
+    from da_vllm.serving import vllm_serve_command
+
+    off = EngineOptions(
+        "Qwen/Qwen3.6-27B", "vanilla", DAConfig(enabled=False),
+        enable_prefix_caching=False,
+    )
+    argv, _ = vllm_serve_command(off)
+    assert "--no-enable-prefix-caching" in argv
+
+    on = EngineOptions(
+        "Qwen/Qwen3.6-27B", "vanilla", DAConfig(enabled=False),
+        enable_prefix_caching=True,
+    )
+    argv, _ = vllm_serve_command(on)
+    assert "--enable-prefix-caching" in argv
+    assert "--no-enable-prefix-caching" not in argv

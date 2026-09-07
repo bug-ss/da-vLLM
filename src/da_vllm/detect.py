@@ -103,6 +103,20 @@ class _Turn:
     end: int
 
 
+def _context_region_end(text: str, family: FamilySpec, header_at: int) -> int:
+    """Where the context stops: the start of the turn holding the question.
+
+    Not the header's own character offset.  The last magic chunk runs up to
+    this point, and it should stop where the instruction turn begins rather
+    than swallowing that turn's opening markers.
+    """
+    if header_at < 0:
+        return len(text)
+    starts = [m.start() for m in re.finditer(re.escape(family.turn_start), text)]
+    earlier = [x for x in starts if x <= header_at]
+    return earlier[-1] if earlier else header_at
+
+
 def _split_turns(text: str, family: FamilySpec) -> list[_Turn]:
     starts = [m.start() for m in re.finditer(re.escape(family.turn_start), text)]
     if not starts:
@@ -136,12 +150,10 @@ def detect_segments(
     if not turns:
         return [], "no turn boundaries found in prompt"
 
-    spans: list[tuple[int, int, int]] = []
+    # First pass: find each magic chunk's tool response and the assistant turn
+    # that owns it.  Ends are assigned afterwards.
+    found: list[tuple[int, int]] = []  # (id, span_start)
     expected = 1
-    # The assistant turn that opened the current run of tool calls.  Gemma 4
-    # collapses consecutive tool calls into one model turn while Qwen opens a
-    # new turn per call, so "which assistant turn owns this response" differs
-    # by family (guide 4.2).
     open_call_turn: _Turn | None = None
     i = 0
     n = len(turns)
@@ -158,34 +170,58 @@ def detect_segments(
             continue
         m = resp_re.match(prompt_text, turn.start, turn.end)
         if m is None:
-            # Any other turn ends the current call/response run.
-            open_call_turn = None
+            # Some other turn.  It does NOT end the run: a document body can
+            # contain the family's turn literal verbatim (it is inserted into
+            # the tool response unescaped), which creates a real turn boundary
+            # inside a chunk.  Treat such turns as part of the chunk they fall
+            # in rather than as a separator -- see the span-end pass below.
             i += 1
             continue
         if open_call_turn is None:
             return [], f"magic chunk {m.group('id')} has no preceding tool call"
-        found = int(m.group("id"))
-        if found != expected:
-            return [], f"magic chunk ids out of order: expected {expected}, found {found}"
-        # The pair ends where the next turn begins (or at the context boundary).
-        pair_end = turns[i + 1].start if i + 1 < n else turn.end
-        pair_end = min(pair_end, context_region_end)
-        # Under strict alternation the span starts at the call turn; the span
-        # of a later response in a collapsed run starts at its own turn, so the
-        # spans stay disjoint either way.
-        span_start = open_call_turn.start if not spans or spans[-1][2] <= open_call_turn.start else turn.start
-        spans.append((found, span_start, pair_end))
+        found_id = int(m.group("id"))
+        if found_id != expected:
+            return [], f"magic chunk ids out of order: expected {expected}, found {found_id}"
+        # Under strict alternation the span starts at the call turn.  In a
+        # collapsed run (Gemma) the later responses start at their own turn, so
+        # the spans stay disjoint either way.
+        span_start = (
+            open_call_turn.start
+            if not found or found[-1][1] < open_call_turn.start
+            else turn.start
+        )
+        found.append((found_id, span_start))
         expected += 1
         if not family.collapses_consecutive_tool_calls:
-            # Qwen: one call turn per response, so the run ends here.
             open_call_turn = None
         i += 1
+
+    # Second pass: each chunk runs to the START OF THE NEXT CHUNK, not to the
+    # next turn of any kind.  Anything between -- including a turn boundary the
+    # document forged -- belongs to the chunk it sits in.  Ending at the next
+    # turn instead would silently truncate the chunk and hide the model's own
+    # content from a <focus> that named it.
+    spans: list[tuple[int, int, int]] = []
+    for idx, (found_id, span_start) in enumerate(found):
+        span_end = (
+            found[idx + 1][1] if idx + 1 < len(found) else context_region_end
+        )
+        spans.append((found_id, span_start, min(span_end, context_region_end)))
 
     if not spans:
         return [], "no magic chunk tool responses detected"
     ids = [s[0] for s in spans]
     if ids != list(range(1, len(ids) + 1)):
         return [], f"detected ids are not exactly 1..N: {ids[:8]}..."
+    # Coverage must be gap-free: chunk N ends exactly where chunk N+1 begins.
+    # A hole means a turn boundary was found inside a chunk and the walk lost
+    # part of it -- decline rather than mask a region we cannot account for.
+    for a, b in zip(spans, spans[1:]):
+        if a[2] != b[1]:
+            return [], (
+                f"gap between magic chunk {a[0]} and {b[0]} "
+                f"({b[1] - a[2]} characters unaccounted for)"
+            )
     return spans, None
 
 
@@ -285,7 +321,7 @@ def build_prompt_map(
     if reason is not None:
         return PromptMap(num_tokens, (), sink_end, local_start, local_fallback, reason)
 
-    context_region_end = header_at if header_at >= 0 else len(prompt_text)
+    context_region_end = _context_region_end(prompt_text, family, header_at)
     raw, reason = detect_segments(
         prompt_text, family, context_region_end=context_region_end
     )

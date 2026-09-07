@@ -27,7 +27,7 @@ accuracy.
 
 ```bash
 pip install -e '.[dev]'
-pytest -q                            # 453 tests, no downloads
+pytest -q                            # 474 tests, no downloads
 python examples/offline_dryrun.py
 ```
 
@@ -129,7 +129,7 @@ kernel has actually executed. Run the checks in
 ## Tests
 
 ```bash
-pytest -q          # 453 tests, no GPU
+pytest -q          # 474 tests, no GPU
 ```
 
 They cover: documents survive being split and rejoined; prompts survive the

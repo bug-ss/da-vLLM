@@ -7,7 +7,14 @@ name = "da-vllm"
 version = "0.1.0"
 description = "Declarative Attention (DA): model-declared sparse attention for vLLM"
 requires-python = ">=3.11"
-dependencies = []
+# torch is imported at package import time (the mask, the remap, the vLLM
+# hook), and jinja2 by da_vllm.testing, which the offline dry run and the test
+# suite both use. Neither is optional in practice, so neither belongs in an
+# extra -- `pip install da-vllm` has to give you a package that imports.
+dependencies = [
+  "torch>=2.4",
+  "jinja2>=3",
+]
 
 [project.optional-dependencies]
 # The versions the paper's results were produced with. Pinned exactly.
@@ -24,7 +31,9 @@ serve = [
   "datasets==3.6.0",
 ]
 # `jinja2` is a runtime dependency of da_vllm.testing, the offline tokenizer.
-dev = ["pytest>=8", "jinja2>=3", "pyflakes>=3"]
+dev = ["pytest>=8", "pyflakes>=3"]
+#: The HTTP client for a vLLM server on another machine.
+remote = ["requests>=2.28"]
 
 [project.scripts]
 da = "da_vllm.cli:main"

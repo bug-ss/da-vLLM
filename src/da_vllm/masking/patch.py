@@ -99,6 +99,55 @@ class PatchState:
         self.block_size_source = "full_attention"
 
 
+class UnsupportedCudagraphMode(RuntimeError):
+    """Raised when the decode path is captured whole, which DA cannot mask."""
+
+
+def assert_cudagraph_mode_supported(vllm_config: Any, config: DAConfig) -> None:
+    """Refuse to run if vLLM captures the decode step in a full CUDA graph.
+
+    DA changes two things per step.  ``block_table`` is mutated in place, so a
+    replayed graph sees it.  ``seq_lens`` cannot be: it is shared across
+    KV-cache groups, so the compacted lengths go into a scratch tensor that is
+    *rebound* onto the metadata object -- and a replayed graph never re-reads a
+    Python attribute.
+
+    Under ``PIECEWISE`` (vLLM's default) attention runs outside the graph and
+    both are picked up normally.  Under ``FULL``, the graph would run the
+    original lengths against a compacted table and read whatever blocks sit
+    past the compacted end: wrong KV, output that still looks plausible.
+
+    So this fails at startup instead.  Every number in the paper came from a
+    stack with attention outside the graph.
+    """
+    compilation = getattr(vllm_config, "compilation_config", None)
+    mode = getattr(compilation, "cudagraph_mode", None)
+    if mode is None:
+        return
+    decode_mode = mode
+    try:
+        if hasattr(mode, "decode_mode"):
+            decode_mode = mode.decode_mode()
+    except Exception:  # pragma: no cover - defensive
+        return
+    if getattr(decode_mode, "name", str(decode_mode)) != "FULL":
+        return
+    message = (
+        f"vLLM is configured with cudagraph_mode={getattr(mode, 'name', mode)}, "
+        "which captures the decode step -- including attention -- in a full "
+        "CUDA graph. DA cannot mask that: the compacted sequence lengths would "
+        "not reach the replayed graph, and the kernel would read the wrong KV "
+        "while still producing plausible text. Run with "
+        "--compilation-config '{\"cudagraph_mode\": \"PIECEWISE\"}' (vLLM's "
+        "default), or set allow_full_cudagraph=true in the DA config if you "
+        "have validated this configuration yourself."
+    )
+    if config.allow_full_cudagraph:
+        logger.warning("da: %s", message)
+        return
+    raise UnsupportedCudagraphMode(message)
+
+
 def get_patch_state() -> PatchState | None:
     return _STATE
 
@@ -173,7 +222,26 @@ def _query_lens(state: PatchState, common_attn_metadata: Any, num_rows: int, dev
     return qsl[1 : num_rows + 1] - qsl[:num_rows]
 
 
-def _apply_remap(state: PatchState, metadata: Any, common_attn_metadata: Any, block_size: int) -> None:
+def _scratch_key(builder: Any) -> str:
+    """A stable name for one KV-cache group's buffers.
+
+    vLLM gives each attention group its own builder holding that group's layer
+    names, so those names identify the group across steps and across builder
+    re-creation.  ``id()`` is the fallback for anything that lacks them.
+    """
+    names = getattr(builder, "layer_names", None)
+    if names:
+        return f"{type(builder).__name__}:{','.join(map(str, names))}"
+    return f"{type(builder).__name__}:{id(builder):x}"
+
+
+def _apply_remap(
+    state: PatchState,
+    metadata: Any,
+    common_attn_metadata: Any,
+    block_size: int,
+    scratch_key: str = "default",
+) -> None:
     store = get_shared_mask()
     if store is None:
         # Normal during vLLM's warmup and profile run, which call the builder
@@ -219,8 +287,12 @@ def _apply_remap(state: PatchState, metadata: Any, common_attn_metadata: Any, bl
 
     # seq_lens is shared across KV-cache groups; block_table is per group.
     # Shrinking the shared tensor in place corrupts the sliding-window group.
+    # Keyed on the calling builder as well as the shape: two full-attention
+    # groups in the same step would otherwise share one buffer, and the second
+    # group's lengths would overwrite the ones the first group's metadata is
+    # still pointing at.
     out_seq_lens = state.scratch.get(
-        "seq_lens", (num_rows,), seq_lens.dtype, device
+        f"seq_lens:{scratch_key}", (num_rows,), seq_lens.dtype, device
     )
     stats = RemapStats() if state.config.log_kept_fraction else None
 
@@ -234,6 +306,7 @@ def _apply_remap(state: PatchState, metadata: Any, common_attn_metadata: Any, bl
             query_lens=query_lens,
             block_size=block_size,
             scratch=state.scratch,
+            scratch_key=scratch_key,
             stats=stats,
         )
     else:
@@ -253,7 +326,10 @@ def _apply_remap(state: PatchState, metadata: Any, common_attn_metadata: Any, bl
         metadata.seq_lens = out_seq_lens
     else:
         padded = state.scratch.get(
-            "seq_lens_padded", tuple(seq_lens.shape), seq_lens.dtype, device
+            f"seq_lens_padded:{scratch_key}",
+            tuple(seq_lens.shape),
+            seq_lens.dtype,
+            device,
         )
         padded.copy_(seq_lens)
         padded[:num_rows].copy_(out_seq_lens)
@@ -303,7 +379,13 @@ def _make_wrapper(original: Callable[..., Any], state: PatchState, bits: dict[st
 
         try:
             # 7. The calling builder's own block size, never a cached global.
-            _apply_remap(state, metadata, common_attn_metadata, int(block_size))
+            _apply_remap(
+                state,
+                metadata,
+                common_attn_metadata,
+                int(block_size),
+                scratch_key=_scratch_key(self),
+            )
         except Exception:  # pragma: no cover - never take the engine down
             logger.exception("da: remap failed; serving this step unmasked")
         return metadata
@@ -361,7 +443,7 @@ def install_patch(config: DAConfig, *, force: bool = False) -> PatchState:
     EngineCore) and, for tensor parallel > 1, a ``sitecustomize.py`` on
     ``PYTHONPATH`` -- attention workers are separately spawned processes that
     never construct the logits processor.  See
-    :func:`da_vllm.masking.sitecustomize_path`.
+    :func:`da_vllm.masking.sitecustomize_dir`.
     """
     global _STATE
     if _STATE is not None and not force:

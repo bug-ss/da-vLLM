@@ -15,7 +15,7 @@ Two implementations of the same function:
   bytes fits and made one model look net-negative.
 
 The two must agree bit-for-bit on ``block_table[:, :num_kept_blocks]`` and on
-``seq_lens``.  ``tests/test_remap_equivalence.py`` sweeps batch sizes, block
+``seq_lens``.  ``tests/test_remap.py`` sweeps batch sizes, block
 sizes, sequence lengths and prune patterns, including R = 0, narrow block
 tables and sequence lengths above ``max_model_len``.
 
@@ -34,7 +34,17 @@ import torch
 
 @dataclass
 class RemapStats:
-    """Only populated when explicitly requested; reading it costs a sync."""
+    """Realized block counts for one step.
+
+    Only populated when explicitly requested; reading it costs a host-device
+    sync, which is why it is off by default.
+
+    Both implementations define these the same way, so the number does not
+    change when ``optimized_remap`` is toggled: ``total_blocks`` counts every
+    valid block in the batch, and ``kept_blocks`` counts the ones the mask
+    allows -- whether or not that row was actually compacted.  (A prefill row
+    is not compacted, but its mask still says what would be kept.)
+    """
 
     kept_blocks: int = 0
     total_blocks: int = 0
@@ -132,19 +142,19 @@ def remap_readable(
             continue
         allowed = block_allowed(mask[r : r + 1], 1, num_blocks, block_size)[0]
         blocks_total += num_blocks
+        # Counted the same way as the optimized path: what the mask allows,
+        # regardless of whether this row gets compacted.
+        kept_total += int(allowed.sum().item())
         # Rows in prefill (query length above 1) and rows with nothing pruned
         # are left untouched.  Chunked prefill therefore needs no handling.
         if int(query_lens[r].item()) != 1 or bool(allowed.all().item()):
-            kept_total += num_blocks
             continue
         kept_cols = torch.nonzero(allowed, as_tuple=False).flatten()
         n_kept = int(kept_cols.numel())
         if n_kept == 0:
             # Cannot happen with a real DA mask (the tail block is always
             # kept); refuse to emit a zero-length sequence if it ever does.
-            kept_total += num_blocks
             continue
-        kept_total += n_kept
         block_table[r, :n_kept] = block_table[r, kept_cols]
         tail_kept = bool(allowed[num_blocks - 1].item())
         tail_valid_len = sl - (num_blocks - 1) * block_size
@@ -165,6 +175,7 @@ def remap_optimized(
     query_lens: torch.Tensor,
     block_size: int,
     scratch: RemapScratch,
+    scratch_key: str = "default",
     stats: RemapStats | None = None,
 ) -> None:
     """Sync-free equivalent of :func:`remap_readable`.
@@ -194,8 +205,10 @@ def remap_optimized(
     # sentinel column, kept blocks to their compacted position.  The buffer is
     # pre-filled with the original table so columns past the compacted end keep
     # their original values, exactly as the readable version leaves them.
+    # Namespaced per caller: two KV-cache groups sharing one scatter buffer in
+    # the same step would corrupt each other's compaction.
     buf = scratch.get(
-        "scatter", (num_rows, table_width + 1), block_table.dtype, device
+        f"scatter:{scratch_key}", (num_rows, table_width + 1), block_table.dtype, device
     )
     buf[:, :table_width].copy_(block_table)
     buf[:, table_width] = 0

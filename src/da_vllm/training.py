@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 
@@ -40,7 +40,7 @@ from .config import DAConfig
 from .detect import PromptMap, build_prompt_map
 from .models import ModelSpec, resolve
 from .prompt import PromptRenderer
-from .state_machine import DAStateMachine, Mode, align_spans
+from .state_machine import DAStateMachine, align_spans
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +128,13 @@ def build_sample(
     group_spans: list[tuple[tuple[int, int], ...]] = []
     group_of_query: list[int] = [-1] * prompt_len
     index_of: dict[tuple[tuple[int, int], ...], int] = {}
-    for t in range(len(response_ids)):
-        sm.advance(response_ids[: t + 1])
+    # Grown in place rather than re-sliced. `advance` tracks how far it has
+    # read, so it only needs a list that gets appended to; slicing per step
+    # would copy tens of millions of elements on a long trace.
+    visible: list[int] = []
+    for token in response_ids:
+        visible.append(token)
+        sm.advance(visible)
         spans = sm.snapshot().spans
         idx = index_of.get(spans)
         if idx is None:
@@ -152,18 +157,6 @@ def build_sample(
             "num_groups": len(group_spans),
         },
     )
-
-
-def per_step_modes(
-    pmap: PromptMap, tokenizer, config: DAConfig, response_ids: Sequence[int]
-) -> list[tuple[Mode, tuple[int, ...]]]:
-    """Replay the trace and report the mode in force at every response step."""
-    sm = DAStateMachine(pmap, tokenizer, config)
-    out: list[tuple[Mode, tuple[int, ...]]] = []
-    for t in range(len(response_ids)):
-        sm.advance(list(response_ids[: t + 1]))
-        out.append((sm.mode, sm.focus_ids))
-    return out
 
 
 def pad_to_flex_multiple(
@@ -192,35 +185,6 @@ def pad_to_flex_multiple(
         pad_len=pad,
         meta=dict(sample.meta),
     )
-
-
-def mask_mod_from_spans(
-    spans: Sequence[tuple[int, int]],
-    boundary: int,
-    prompt_len: int,
-    *,
-    kv_block_size: int | None = None,
-):
-    """A FlexAttention ``mask_mod`` for one frozen DA mode.
-
-    ``kv_block_size`` should be **the served KV block size** if you want train
-    and serve to agree exactly; leaving it None trains against a token-granular
-    mask, which is a known approximation.
-    """
-    kept = align_spans(spans, kv_block_size) if kv_block_size else tuple(spans)
-    starts = torch.tensor([s for s, _ in kept], dtype=torch.long)
-    ends = torch.tensor([e for _, e in kept], dtype=torch.long)
-
-    def mask_mod(b, h, q_idx, kv_idx):  # noqa: ARG001 - FlexAttention signature
-        causal = kv_idx <= q_idx
-        prompt_row = q_idx < prompt_len
-        past_boundary = kv_idx >= boundary
-        in_span = torch.zeros_like(kv_idx, dtype=torch.bool)
-        for s, e in zip(starts.tolist(), ends.tolist()):
-            in_span = in_span | ((kv_idx >= s) & (kv_idx < e))
-        return causal & (prompt_row | past_boundary | in_span)
-
-    return mask_mod
 
 
 def allowed_block_table(

@@ -157,9 +157,6 @@ class SimpleTokenizer:
             add_generation_prompt=add_generation_prompt,
             **kwargs,
         )
-        # Jinja's whitespace control in the fake templates leaves stray newlines
-        # between control blocks; strip them the way the real templates do.
-        rendered = re.sub(r"\n(?=<\|im_start\|>|<start_of_turn>|$)", "\n", rendered)
         rendered = rendered.strip("\n")
         if tokenize:
             return self.encode(rendered)

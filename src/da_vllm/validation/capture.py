@@ -77,8 +77,32 @@ class MetadataCapture:
         self.steps: list[CapturedStep] = []
         self._installed: list[tuple[Any, Any]] = []
         self._step = 0
+        self._warned = False
 
-    def record(self, metadata: Any, block_size: int, backend: str = "") -> None:
+    def _warn_no_baseline(self) -> None:
+        if not self._warned:
+            self._warned = True
+            logger.warning(
+                "da: capture has no pre-compaction sequence lengths, so the "
+                "kept fraction will read as 1.0. Install the capture through "
+                "MetadataCapture.install(), which supplies them."
+            )
+
+    def record(
+        self,
+        metadata: Any,
+        block_size: int,
+        backend: str = "",
+        original_seq_lens: Any = None,
+    ) -> None:
+        """Record one step.
+
+        ``original_seq_lens`` is the length BEFORE compaction.  Without it there
+        is nothing to compare against: the metadata's own ``seq_lens`` has
+        already been shortened, so kept and total would both be derived from it
+        and the ratio would be 1.0 for every input -- which is exactly the
+        "nothing was pruned" answer this harness exists to disprove.
+        """
         if len(self.steps) >= self.limit:
             return
         block_table = getattr(metadata, "block_table", None)
@@ -87,9 +111,16 @@ class MetadataCapture:
             return
         import math
 
-        lens = [int(x) for x in seq_lens.tolist()[: block_table.shape[0]]]
-        kept = [max(1, math.ceil(n / block_size)) for n in lens]
-        total = [min(block_table.shape[1], k) for k in kept]
+        rows = block_table.shape[0]
+        width = block_table.shape[1]
+        lens = [int(x) for x in seq_lens.tolist()[:rows]]
+        kept = [min(width, max(0, math.ceil(n / block_size))) for n in lens]
+        if original_seq_lens is None:
+            self._warn_no_baseline()
+            total = kept
+        else:
+            before = [int(x) for x in original_seq_lens.tolist()[:rows]]
+            total = [min(width, max(0, math.ceil(n / block_size))) for n in before]
         self.steps.append(
             CapturedStep(
                 step=self._step,
@@ -125,13 +156,19 @@ class MetadataCapture:
 
             def make(fn, backend):
                 def build(self, common_prefix_len, common_attn_metadata, fast_build=False, **kw):
+                    # Snapshot the lengths BEFORE the DA hook compacts them.
+                    before = getattr(common_attn_metadata, "seq_lens", None)
+                    before = before.clone() if before is not None else None
                     metadata = fn(
                         self, common_prefix_len, common_attn_metadata,
                         fast_build=fast_build, **kw,
                     )
                     block_size = getattr(self, "block_size", None)
                     if block_size:
-                        capture.record(metadata, int(block_size), backend)
+                        capture.record(
+                            metadata, int(block_size), backend,
+                            original_seq_lens=before,
+                        )
                     return metadata
 
                 return build

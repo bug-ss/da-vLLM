@@ -188,6 +188,19 @@ class DAEngine:
             self._llm = build_llm(self.options)
         return self._llm
 
+    def default_block_size(self) -> int | None:
+        """The KV block size the engine is really using, if it is known yet.
+
+        Learned from the first metadata build; falls back to the registry's
+        observed value so offline replays still produce a block-level figure.
+        """
+        from .masking.patch import get_patch_state
+
+        state = get_patch_state()
+        if state is not None and state.block_size:
+            return state.block_size
+        return self.spec.geometry.observed_full_attention_block
+
     def sampling_params(self, **overrides) -> dict[str, Any]:
         params = self.spec.sampling.to_dict()
         if self.max_tokens is not None:
@@ -282,7 +295,15 @@ class DAEngine:
         mask_lag_steps: int = 2,
         block_size: int | None = None,
     ) -> list[DAAnswer]:
-        """Answer a batch.  One engine call, so the batch actually batches."""
+        """Answer a batch.  One engine call, so the batch actually batches.
+
+        ``block_size`` defaults to whatever the engine actually chose, so
+        ``block_aligned_attended_tokens`` is populated without the caller
+        having to know it.  That figure is what validation check 9.3 compares
+        the kernel's realized kept fraction against.
+        """
+        if block_size is None:
+            block_size = self.default_block_size()
         pairs = list(items)
         prompts = [self.render(ctx, q) for ctx, q in pairs]
         token_ids = [

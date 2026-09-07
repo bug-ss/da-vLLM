@@ -104,3 +104,44 @@ def test_da_reference_mask_keeps_the_scaffold_and_the_future():
 def test_sliding_reference_mask_is_a_window():
     m = sliding_mask_4d(6, 3)[0, 0]
     assert m[5].tolist() == [False, False, False, True, True, True]
+
+
+def test_round_trip_uses_the_config_it_was_given(family_case, filler):
+    """The harness must not create the disagreement it is meant to detect."""
+    from da_vllm.config import DAConfig
+
+    hub_id, tok, _ = family_case
+    custom = DAConfig(
+        enabled=True, max_model_len=131072, question_header="### THE QUESTION",
+        segment_target_tokens=2048, segment_max_tokens=2560,
+    )
+    results = round_trip(tok, hub_id, default_cases(filler), custom)
+    assert_round_trip(results)
+
+
+def test_round_trip_notices_a_hole_in_the_chunk_spans(family_case, config, filler, monkeypatch):
+    """Counting chunks is not enough; coverage is what catches a forged turn."""
+    from da_vllm import detect as detect_mod
+    from da_vllm.detect import SegmentSpan
+
+    hub_id, tok, renderer = family_case
+    real = detect_mod.build_prompt_map
+
+    def holey(*args, **kwargs):
+        pmap = real(*args, **kwargs)
+        if len(pmap.segments) < 2:
+            return pmap
+        first, *rest = pmap.segments
+        shrunk = SegmentSpan(
+            first.index, first.char_start, first.char_end,
+            first.token_start, max(first.token_start + 1, first.token_end - 40),
+        )
+        return type(pmap)(
+            pmap.num_prompt_tokens, (shrunk, *rest), pmap.sink_end,
+            pmap.local_window_start, pmap.local_window_is_fallback, pmap.failure_reason,
+        )
+
+    monkeypatch.setattr("da_vllm.validation.checks.build_prompt_map", holey)
+    results = round_trip(tok, hub_id, default_cases(filler)[:1], config, renderer=renderer)
+    assert not results[0].ok
+    assert any("gap of" in note for note in results[0].notes)

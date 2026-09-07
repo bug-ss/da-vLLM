@@ -36,6 +36,12 @@ class SharedMaskStore:
             (self.max_num_seqs, self.max_model_len), dtype=torch.bool, device=self.device
         )
         self._staging: dict[int, torch.Tensor] = {}
+        #: One CUDA event per staging buffer, recorded after its copy. The
+        #: copy is asynchronous, so refilling the buffer on the host before it
+        #: has drained would race the transfer -- "pinned and on the same
+        #: stream" makes the copy ordered against other GPU work, not against
+        #: the CPU.
+        self._staging_done: dict[int, torch.cuda.Event] = {}
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -124,6 +130,10 @@ class SharedMaskStore:
                 pin_memory=self.pin_memory,
             )
             self._staging[row] = buf
+        else:
+            pending = self._staging_done.get(row)
+            if pending is not None:
+                pending.synchronize()  # last step's copy has drained
         buf.fill_(False)
         for s, e in spans:
             s = max(0, min(s, self.max_model_len))
@@ -139,6 +149,11 @@ class SharedMaskStore:
                 view = buf[:n].unflatten(0, (n // block_size, block_size))
                 view.copy_(view.any(dim=1, keepdim=True).expand_as(view))
         self.tensor[row].copy_(buf, non_blocking=self.pin_memory)
+        if self.pin_memory:
+            event = self._staging_done.get(row)
+            if event is None:
+                event = self._staging_done[row] = torch.cuda.Event()
+            event.record()
 
 
 def install_shared_mask(

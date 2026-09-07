@@ -97,3 +97,23 @@ def test_install_is_idempotent_and_clearable():
 def test_reported_size_matches_the_documented_footprint():
     store = SharedMaskStore(8, 1024, "cpu")
     assert store.nbytes() == 8 * 1024
+
+
+def test_the_staging_buffer_is_reused_and_guarded_between_writes():
+    """The dense writer stages through one pinned buffer per slot.
+
+    On CPU there is no async copy to race, so this only checks the buffer is
+    reused (allocating a fresh one per step was the alternative) and that
+    repeated writes stay correct.
+    """
+    store = SharedMaskStore(2, 128, "cpu")
+    first = MaskSnapshot(Mode.FOCUS, ((0, 16), (48, 64)), 96)
+    second = MaskSnapshot(Mode.LOCAL, ((0, 16),), 96)
+    store.write_snapshot(0, first, block_size=16, optimized=False)
+    buffer_id = id(store._staging[0])
+    store.write_snapshot(0, second, block_size=16, optimized=False)
+    assert id(store._staging[0]) == buffer_id, "buffer should be reused"
+
+    reference = SharedMaskStore(2, 128, "cpu")
+    reference.write_snapshot(0, second, block_size=16, optimized=True)
+    assert torch.equal(store.tensor[0], reference.tensor[0])

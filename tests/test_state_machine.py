@@ -224,3 +224,28 @@ def test_incremental_detokenizer_holds_back_partial_characters():
     parts = [d.push(b) for b in "é>".encode()]
     assert parts[0] == ""  # first byte of a two-byte character is held
     assert "".join(parts) == "é>"
+
+
+def test_one_tag_is_counted_once_even_when_more_arrows_follow(machine):
+    """The regexes are tail-anchored with slack, so the same tag re-matches on
+    the next token containing '>'. A declined focus counted several times
+    inflates the published focus-attempt rate."""
+    tok, _, sm = machine
+    _feed(tok, sm, '<focus magic_chunks="9999">a>b>c')
+    assert sm.stats.focus_attempts == 1
+    assert sm.stats.declines == ["unknown_id"]
+    assert sm.mode is Mode.GLOBAL
+
+
+def test_the_decoded_text_is_available_once_for_the_runaway_detector(machine):
+    tok, _, sm = machine
+    text = '<local>hello there</local>'
+    collected = ""
+    stream = getattr(sm, "_test_stream", None) or []
+    sm._test_stream = stream
+    for token in tok.encode(text, add_special_tokens=False):
+        stream.append(token)
+        sm.advance(stream)
+        collected += sm.take_new_text()
+    assert collected == text
+    assert sm.take_new_text() == ""  # drained, not replayed

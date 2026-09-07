@@ -30,8 +30,7 @@ from ..config import DAConfig
 from ..models import JUDGE_MODEL, ModelSpec, resolve
 from .data import SOURCE_KEYS, Example, get_source, prepare_source
 from .judge import judge_messages, judge_sampling_params, parse_verdict
-from .records import ARMS, ResponseRecord, write_records
-from .run import new_run_id
+from .records import ARMS, ResponseRecord, new_run_id, write_records
 from .score import report
 
 logger = logging.getLogger(__name__)
@@ -133,8 +132,9 @@ class RunSpec:
     output_dir: Path
     sources: tuple[str, ...] = SOURCE_KEYS
     arms: tuple[str, ...] = ARMS
-    samples_per_source: int = 128
-    seed: int = 42
+    #: Cap on examples generated per source.  ``None`` means "everything the
+    #: prepared file holds", which is what `da prepare` already sampled to.
+    samples_per_source: int | None = None
     max_tokens: int = 8192
     max_num_seqs: int = 256
     batch_size: int = 32
@@ -182,6 +182,8 @@ def run_arm(
     try:
         for source in spec.sources:
             rows = examples_by_source.get(source, [])
+            if spec.samples_per_source is not None:
+                rows = rows[: spec.samples_per_source]
             for start in range(0, len(rows), spec.batch_size):
                 batch = rows[start : start + spec.batch_size]
                 answers = engine.answer_batch(
@@ -215,6 +217,10 @@ def run_arm(
                             },
                         )
                     )
+                # Written after every batch, not at the end: one over-length
+                # prompt raising out of answer_batch would otherwise throw away
+                # a whole arm's worth of finished generations.
+                write_records(spec.records_path(arm), records)
                 if progress is not None:
                     progress(source, min(start + spec.batch_size, len(rows)), len(rows))
     finally:
@@ -244,6 +250,29 @@ def run_all(
 
 
 # -- judging ----------------------------------------------------------------
+
+
+def shutdown_engine(llm: Any) -> bool:
+    """Shut an engine down properly, wherever the method happens to live.
+
+    Returns True if something was called.  An engine that is merely
+    dereferenced leaves its EngineCore subprocess to be reaped later, still
+    holding VRAM.
+    """
+    engine = getattr(llm, "llm_engine", None)
+    for target in (getattr(engine, "engine_core", None), engine, llm):
+        shutdown = getattr(target, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:  # pragma: no cover
+                logger.exception("da: engine shutdown raised; check for leaked VRAM")
+            return True
+    logger.warning(
+        "da: found no shutdown() on the engine; its subprocess may outlive "
+        "this process and hold VRAM"
+    )
+    return False
 
 
 def judge_with_vllm(
@@ -318,9 +347,10 @@ def judge_with_vllm(
                 rec.judge_truncated = verdict.truncated
     finally:
         if owned:
-            shutdown = getattr(getattr(llm, "llm_engine", None), "shutdown", None)
-            if callable(shutdown):
-                shutdown()
+            # Same walk DAEngine.close() uses: in vLLM 0.20.2 shutdown lives on
+            # the EngineCoreClient, not on LLM or LLMEngine. Probing only
+            # llm_engine finds nothing and leaks the judge's subprocess.
+            shutdown_engine(llm)
 
     truncated = sum(1 for r in records if r.judge_truncated)
     if truncated:

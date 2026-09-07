@@ -142,18 +142,6 @@ def build_llm(options: EngineOptions):
     return LLM(**options.engine_kwargs())
 
 
-def sampling_params_for(model: str | ModelSpec, **overrides):
-    """Model-card sampling parameters.  Unknown models raise, never default."""
-    spec = resolve(model)
-    from vllm import SamplingParams  # type: ignore
-
-    params = spec.sampling.to_dict()
-    params.update(overrides)
-    # n = 1, no seed: generation is unseeded and small run-to-run movement is
-    # expected (guide 8.3/8.6).
-    return SamplingParams(n=1, **params)
-
-
 @contextmanager
 def engine_process(argv: Sequence[str], env: dict[str, str] | None = None, *, timeout: float = 60.0):
     """Run an engine in its own process group and kill the whole group.
@@ -205,8 +193,11 @@ def vllm_serve_command(options: EngineOptions) -> tuple[list[str], dict[str, str
     for key, value in kwargs.items():
         flag = "--" + key.replace("_", "-")
         if isinstance(value, bool):
-            if value:
-                argv.append(flag)
+            # A False boolean is not "leave it out": vLLM's default for
+            # enable_prefix_caching is ON, and the timing protocol needs it OFF.
+            # Dropping the flag would silently measure against a cached
+            # baseline.
+            argv.append(flag if value else f"--no-{key.replace('_', '-')}")
         else:
             argv += [flag, str(value)]
     if logits_processors:

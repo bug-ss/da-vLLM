@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -166,3 +167,15 @@ def test_score_refuses_a_partial_source_list(tmp_path):
     write_records(path, records)
     with pytest.raises(MissingSourceError):
         cli.main(["score", "--model", MODEL, "--records", str(path)])
+
+
+def test_serve_command_keeps_the_mask_the_same_height_as_the_batch(capsys):
+    """The DA config sizes the mask. If it lags the engine's max_num_seqs,
+    every slot past the mask's height serves unmasked."""
+    assert cli.main([
+        "serve-command", "--model", MODEL, "--arm", "da", "--max-num-seqs", "512",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "--max-num-seqs 512" in out
+    config = json.loads(re.search(r"export DA_VLLM_CONFIG=(.*)", out).group(1).strip("'\""))
+    assert config["max_num_seqs"] == 512

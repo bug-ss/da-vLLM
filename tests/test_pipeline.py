@@ -331,3 +331,62 @@ def test_synthetic_questions_only_replace_synthetic_sources():
     assert rows[0].meta["question_author"] == "gemini-3-flash"
     with pytest.raises(ValueError, match="original QA"):
         attach_questions(rows[1:], {"b": "new question"}, author_model="x")
+
+
+def test_records_survive_a_failure_part_way_through(tmp_path):
+    """One over-length prompt must not discard an arm's finished generations."""
+    from da_vllm.eval.records import read_records
+
+    tokenizer = qwen_tokenizer()
+    sources = SOURCE_KEYS[:1]
+    spec = RunSpec(
+        model=MODEL, output_dir=tmp_path, sources=tuple(sources),
+        max_tokens=1024, batch_size=1,
+    )
+    rows = _examples(3, sources)
+    engine = _engine(tokenizer)
+    calls = {"n": 0}
+    original = engine.answer_batch
+
+    def explode(items, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise ValueError("prompt is 999999 tokens; never truncated")
+        return original(items, **kwargs)
+
+    engine.answer_batch = explode
+    with pytest.raises(ValueError):
+        run_arm(spec, "da", {sources[0]: rows}, engine=engine)
+
+    on_disk = list(read_records(spec.records_path("da")))
+    assert len(on_disk) == 2, "finished records were thrown away"
+
+
+def test_the_judge_engine_is_actually_shut_down():
+    """vLLM 0.20.2 puts shutdown() on the EngineCoreClient, not on LLMEngine."""
+    from da_vllm.eval.pipeline import shutdown_engine
+
+    calls = []
+
+    class _Core:
+        def shutdown(self):
+            calls.append("engine_core")
+
+    class _LLM:
+        llm_engine = type("E", (), {"engine_core": _Core()})()
+
+    assert shutdown_engine(_LLM()) is True
+    assert calls == ["engine_core"]
+    assert shutdown_engine(object()) is False
+
+
+def test_samples_per_source_actually_caps_the_run(tmp_path):
+    tokenizer = qwen_tokenizer()
+    sources = SOURCE_KEYS[:1]
+    spec = RunSpec(
+        model=MODEL, output_dir=tmp_path, sources=tuple(sources),
+        max_tokens=1024, batch_size=2, samples_per_source=2,
+    )
+    with _engine(tokenizer) as engine:
+        records = run_arm(spec, "da", {sources[0]: _examples(5, sources)}, engine=engine)
+    assert len(records) == 2

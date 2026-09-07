@@ -11,7 +11,7 @@ document is never removed and never re-fetched — it just stops being re-read.
 
 ```bash
 pip install -e '.[dev]'
-pytest -q                            # 453 tests, no downloads
+pytest -q                            # 474 tests, no downloads
 python examples/offline_dryrun.py
 ```
 
@@ -105,7 +105,7 @@ installed in the wrong Python environment and is doing nothing.
 Install the package and the model's **tokenizer only** — no weights, no GPU:
 
 ```bash
-pip install da-vllm requests
+pip install 'da-vllm[remote]'
 ```
 
 Then:
@@ -205,6 +205,11 @@ cost saving you pay for with a little accuracy. It does not make answers better.
 
 ## Things that will not work yet
 
+- **Full CUDA graphs over the decode step.** If vLLM is started with
+  `cudagraph_mode=FULL`, DA refuses to start and says so. The shortened
+  sequence lengths cannot reach a replayed graph, so it would read the wrong
+  part of the document while still producing plausible text. vLLM's default
+  (`PIECEWISE`) runs attention outside the graph and is fine.
 - **More than one GPU per model.** If Gemma is split across GPUs
   (`--tensor-parallel-size 2` or more), DA installs, finds nothing to do, warns,
   and serves normally. Everything in the paper was single-GPU.

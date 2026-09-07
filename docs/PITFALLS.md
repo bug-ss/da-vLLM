@@ -10,6 +10,12 @@ wrong, which is why so much of this codebase is checks and refusals.
 
 | Failure | Prevention |
 | --- | --- |
+| A document containing the model's own turn markers forges a chunk boundary, so part of a chunk falls outside every span and `<focus>` hides the model's own content — with the chunk count still correct, so nothing flags it | Chunks now run to the start of the *next chunk*, not the next turn of any kind, so a forged boundary is absorbed. Detection also refuses on any gap, and the round-trip harness checks span **coverage**, not just counts |
+| A full CUDA graph over the decode step: the compacted block table reaches the replayed graph but the shortened lengths do not, so the kernel reads past the end of the compacted table | Refused at startup with an explanation, unless `allow_full_cudagraph` is set deliberately |
+| Two KV-cache groups sharing one scratch buffer, so the second group's lengths land on the first group's metadata | Buffers are keyed by the calling group's layer names, not by shape alone |
+
+| Failure | Prevention |
+| --- | --- |
 | Patch installed in the parent process, where vLLM V1 runs nothing | Installed from `DALogitsProcessor.__init__`, which vLLM constructs inside EngineCore (`masking/patch.py::install_patch`). Logs a **warning** naming the pid if no builder was patched, and another if no shared mask exists after 64 build calls |
 | Attention workers under TP > 1 never construct the logits processor | `masking.worker_env()` ships `resources/sitecustomize.py` on `PYTHONPATH` with `VLLM_WORKER_MULTIPROC_METHOD=spawn`; `docs/ENVIRONMENT.md` states plainly that the mask itself is not broadcast to TP ranks |
 | An "is this vanilla" shortcut keyed on config shape also matched DA traffic | DA is per-request opt-in via an explicit `da_enable` flag; nothing is inferred from prompt or config shape (`masking/logits_processor.py`, `validation/checks.py::assert_explicit_enable`) |

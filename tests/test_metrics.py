@@ -219,7 +219,14 @@ def test_deriving_from_a_live_config_produces_a_usable_geometry():
         "num_key_value_heads": 8,
         "sliding_window": 1024,
     }
-    derived = geometry_from_config(spec, config)
+    # The config states the global-layer geometry but not the sliding-window
+    # read, so deriving without it would bless a placeholder as "derived".
+    with pytest.raises(GeometryError, match="local_bytes_per_step"):
+        geometry_from_config(spec, config)
+
+    derived = geometry_from_config(
+        spec, config, local_bytes_per_step=40 * 1024 * 8 * 256 * 2 * 2
+    )
     assert derived.verified and derived.source == "derived"
     assert derived.global_kv_bytes_per_token == global_kv_bytes_per_token(config)
     roofline_response(

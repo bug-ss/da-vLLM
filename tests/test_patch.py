@@ -139,12 +139,15 @@ def test_shared_seq_lens_is_routed_through_a_stable_scratch(vllm):
     store.tensor[0, 112:] = True
 
     ptrs = set()
+    # One builder, several steps -- which is what vLLM does: a builder is
+    # created per KV-cache group and reused for the life of the engine.
+    bt = torch.arange(10, 18, dtype=torch.int32).reshape(1, 8)
+    b = _builder(
+        vllm["vllm.v1.attention.backends.flash_attn"].FlashAttentionMetadataBuilder,
+        fake_vllm.FullAttentionSpec(), 16, bt,
+    )
     for _ in range(3):
-        bt = torch.arange(10, 18, dtype=torch.int32).reshape(1, 8)
-        b = _builder(
-            vllm["vllm.v1.attention.backends.flash_attn"].FlashAttentionMetadataBuilder,
-            fake_vllm.FullAttentionSpec(), 16, bt,
-        )
+        bt.copy_(torch.arange(10, 18, dtype=torch.int32).reshape(1, 8))
         common = _common([128], [1])
         shared_before = common.seq_lens.clone()
         md = b.build(0, common)
@@ -383,3 +386,91 @@ def test_the_reuse_hazard_is_real_if_reuse_is_left_on(vllm):
     # Full table, compacted length: the kernel would read blocks 100 and 101.
     assert torch.equal(reused.block_table, other_group_table)
     assert int(reused.seq_lens[0]) == 32
+
+
+def test_two_full_attention_groups_do_not_share_a_scratch_buffer(vllm):
+    """Two maskable groups in one step must not overwrite each other's lengths.
+
+    They are separate builders with separate layer names, so they must get
+    separate buffers -- otherwise the second group's compacted lengths land on
+    the first group's metadata, next to the first group's block table.
+    """
+    install_patch(DAConfig(enabled=True), force=True)
+    store = install_shared_mask(2, 256, "cpu", force=True)
+    store.tensor[0].fill_(False)
+    store.tensor[0, :16] = True
+    store.tensor[0, 112:] = True
+
+    cls = vllm["vllm.v1.attention.backends.flash_attn"].FlashAttentionMetadataBuilder
+    made = []
+    for layers, table in (("layers.0", 10), ("layers.1", 100)):
+        bt = torch.arange(table, table + 8, dtype=torch.int32).reshape(1, 8)
+        b = _builder(cls, fake_vllm.FullAttentionSpec(), 16, bt)
+        b.layer_names = (layers,)
+        made.append((b, b.build(0, _common([128], [1]))))
+
+    (_, md_a), (_, md_b) = made
+    assert md_a.seq_lens.data_ptr() != md_b.seq_lens.data_ptr()
+    assert int(md_a.seq_lens[0]) == int(md_b.seq_lens[0]) == 32
+
+
+def test_a_full_cudagraph_over_decode_is_refused(vllm):
+    """The compacted lengths cannot reach a replayed full graph."""
+    import enum
+
+    from da_vllm.masking.patch import (
+        UnsupportedCudagraphMode,
+        assert_cudagraph_mode_supported,
+    )
+
+    class Mode(enum.Enum):
+        PIECEWISE = 1
+        FULL = 2
+
+        def decode_mode(self):
+            return self
+
+    class Compilation:
+        def __init__(self, mode):
+            self.cudagraph_mode = mode
+
+    class Config:
+        def __init__(self, mode):
+            self.compilation_config = Compilation(mode)
+
+    off = DAConfig(enabled=True)
+    assert_cudagraph_mode_supported(Config(Mode.PIECEWISE), off)  # fine
+    assert_cudagraph_mode_supported(Config(None), off)  # unknown: don't guess
+    with pytest.raises(UnsupportedCudagraphMode, match="PIECEWISE"):
+        assert_cudagraph_mode_supported(Config(Mode.FULL), off)
+    # An expert who has validated it can override.
+    assert_cudagraph_mode_supported(
+        Config(Mode.FULL), DAConfig(enabled=True, allow_full_cudagraph=True)
+    )
+
+
+def test_capture_reports_a_real_kept_fraction(vllm):
+    """Deriving both numbers from the already-compacted lengths would make the
+    ratio 1.0 for every input -- i.e. 'nothing was pruned', which is exactly
+    what this harness exists to disprove."""
+    from da_vllm.validation.capture import MetadataCapture, kept_fraction_series
+
+    install_patch(DAConfig(enabled=True), force=True)
+    store = install_shared_mask(2, 256, "cpu", force=True)
+    store.tensor[0].fill_(False)
+    store.tensor[0, :16] = True
+    store.tensor[0, 112:] = True
+
+    capture = MetadataCapture(limit=2)
+    with capture:
+        bt = torch.arange(10, 18, dtype=torch.int32).reshape(1, 8)
+        b = _builder(
+            vllm["vllm.v1.attention.backends.flash_attn"].FlashAttentionMetadataBuilder,
+            fake_vllm.FullAttentionSpec(), 16, bt,
+        )
+        b.build(0, _common([128], [1]))
+
+    step = capture.steps[0]
+    assert step.total_blocks == [8]   # before compaction
+    assert step.kept_blocks == [2]    # after
+    assert kept_fraction_series(capture.steps)[0] == pytest.approx(0.25)

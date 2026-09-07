@@ -94,6 +94,10 @@ class DAConfig:
     #: Log the realized kept-block fraction from inside the remap.  This adds a
     #: host-device sync per step: never leave it on while timing (guide 9.3).
     log_kept_fraction: bool = False
+    #: Serve anyway when vLLM captures the decode path in a *full* CUDA graph.
+    #: Off by default because it is not safe: see the check in
+    #: :func:`da_vllm.masking.patch.assert_cudagraph_mode_supported`.
+    allow_full_cudagraph: bool = False
     #: Pass num_stages=2 to vLLM 0.20.2's Triton decode kernel.  Bit-exact, a
     #: few percent end to end, and entirely independent of DA (guide 7).
     triton_decode_num_stages: int | None = 2

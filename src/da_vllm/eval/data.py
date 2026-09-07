@@ -16,6 +16,12 @@ Rules encoded here (guide 8.1, paper D.1):
 Two source names that look alike were once swapped in a run, and stale result
 directories leaked into an average, so :data:`SOURCES` is the explicit list
 every downstream aggregation is computed against.
+
+:data:`SOURCES` also records where each source comes from (dataset path, config
+name, split, field names), which is what you need to build the JSONL file
+:mod:`da_vllm.eval.pipeline` reads.  Building that file is left to you: the
+rubrics and the four sources' synthetic questions are inputs no public split
+carries, so a loader here would only cover the easy half.
 """
 
 from __future__ import annotations
@@ -141,35 +147,6 @@ def prepare_source(
     rng = random.Random(seed)
     rng.shuffle(kept)
     return kept[:n]
-
-
-def load_hf_source(spec: SourceSpec, **load_kwargs) -> list[Example]:
-    """Load one source through ``datasets``.
-
-    Kept deliberately thin: rubric generation and any synthetic-question
-    substitution happen upstream and are merged in by
-    :func:`attach_rubrics`, so this function never invents fields.
-    """
-    try:
-        from datasets import load_dataset  # type: ignore
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError(
-            "`datasets` is required to load benchmark sources: pip install "
-            "'da-vllm[serve]'"
-        ) from exc
-    ds = load_dataset(spec.hf_path, spec.hf_name, split=spec.split, **load_kwargs)
-    out: list[Example] = []
-    for i, row in enumerate(ds):
-        out.append(
-            Example(
-                example_id=f"{spec.key}:{i}",
-                source=spec.key,
-                context=str(row[spec.context_field]),
-                question=str(row[spec.question_field]),
-                reference_answer=str(row[spec.answer_field]),
-            )
-        )
-    return out
 
 
 def attach_rubrics(

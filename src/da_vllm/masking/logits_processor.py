@@ -25,7 +25,7 @@ from ..detect import build_prompt_map
 from ..models import ModelSpec, resolve
 from ..runaway import RunawayDetector
 from ..state_machine import DAStateMachine
-from .patch import get_patch_state, install_patch
+from .patch import assert_cudagraph_mode_supported, get_patch_state, install_patch
 from .shared import SharedMaskStore, install_shared_mask
 
 logger = logging.getLogger(__name__)
@@ -229,7 +229,10 @@ class DADriver:
             changed = entry.state.advance(entry.output_token_ids)
             if entry.detector is not None and entry.state.num_consumed > before:
                 new_ids = list(entry.output_token_ids[before : entry.state.num_consumed])
-                entry.detector.observe(new_ids, "")
+                # The decoded text matters: without it the word-level signal is
+                # dead and "no </answer> yet" degenerates into a bare token cap
+                # that fires on perfectly good long answers.
+                entry.detector.observe(new_ids, entry.state.take_new_text())
             if changed or entry.dirty:
                 self.store.write_snapshot(
                     row,
@@ -316,6 +319,10 @@ class DALogitsProcessor(LogitsProcessorBase):  # type: ignore[misc]
         if not self.config.enabled:
             logger.info("da: disabled by config; logits processor is inert")
             return
+
+        # A full CUDA graph over the decode step would silently defeat the
+        # mask; fail here rather than serve wrong KV.
+        assert_cudagraph_mode_supported(vllm_config, self.config)
 
         # Install from inside the engine process (guide 6.1).
         install_patch(self.config)

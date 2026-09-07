@@ -125,8 +125,12 @@ def cmd_validate(args) -> int:
 def cmd_serve_command(args) -> int:
     from .serving import EngineOptions, vllm_serve_command
 
+    # The DA config's max_num_seqs sizes the mask, so it must match the engine's
+    # or slots past the mask's height serve unmasked.
     config = DAConfig(
-        enabled=args.arm == "da", max_model_len=get_model(args.model).max_model_len
+        enabled=args.arm == "da",
+        max_model_len=get_model(args.model).max_model_len,
+        max_num_seqs=args.max_num_seqs,
     )
     options = EngineOptions(args.model, args.arm, config, max_num_seqs=args.max_num_seqs)
     argv, env = vllm_serve_command(options)
@@ -309,7 +313,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--arm", choices=list(ARMS), help="omit to run all three in sequence")
     p.add_argument("--sources")
-    p.add_argument("-n", type=int, default=128)
+    p.add_argument("-n", type=int, default=None,
+                   help="cap examples per source (default: all of them)")
     p.add_argument("--max-tokens", type=int, default=8192)
     p.add_argument("--max-num-seqs", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=32)
